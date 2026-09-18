@@ -59,8 +59,21 @@ def _from_kite(symbol: str, interval: str, lookback_days: int, kite) -> pd.DataF
 
     df = fetch_ohlcv(kite, symbol, interval, lookback_days)
     if df.empty:
-        return df
+        raise RuntimeError(f"Kite returned no {interval} candles for {symbol}")
     return _tag(df, "kite")
+
+
+def kite_health(kite) -> tuple[bool, str]:
+    """One live check: can we actually pull NSE candles from Zerodha?"""
+    if kite is None:
+        return False, "No Zerodha Kite session (not logged in, or the token expired)."
+    try:
+        df = _from_kite("RELIANCE", "5m", 2, kite)
+        if df.empty:
+            return False, "Kite returned no candles for RELIANCE."
+        return True, "ok"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"{type(exc).__name__}: {exc}"
 
 
 def _from_yahoo_daily(symbol: str, period: str) -> pd.DataFrame:

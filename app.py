@@ -8,7 +8,7 @@ import kite_client
 import paper_trader
 import scanner
 import universe
-from data import market_status, next_session_label
+from data import kite_health, market_status, next_session_label
 
 st.set_page_config(page_title="Intraday NSE Dashboard", layout="wide")
 
@@ -113,13 +113,13 @@ universe_name = st.sidebar.selectbox(
     help="The stocks the app is allowed to buy. Independent of your watchlist.",
 )
 trade_universe = universe.get(universe_name)
-max_positions = st.sidebar.slider("Maximum open positions", 1, 10, 3)
-minimum_confidence = st.sidebar.slider("Minimum confidence (%)", 25, 100, 50, step=5)
+max_positions = st.sidebar.slider("Maximum open positions", 1, 10, 5)
+minimum_confidence = st.sidebar.slider("Minimum confidence (%)", 25, 100, 65, step=5)
 require_kite_for_entry = st.sidebar.checkbox(
     "Require Zerodha data for new entries",
-    value=False,
-    help="Off by default. Kite market data needs a paid subscription; while it is "
-    "unavailable, entries are simulated against delayed Yahoo prices.",
+    value=True,
+    help="On by default. Unchecking allows paper entries on delayed Yahoo prices "
+    "and emails ALERT_EMAIL once.",
 )
 if paper_trader.email_ready():
     st.sidebar.success("Email alerts configured")
@@ -135,10 +135,23 @@ if paper_trader.email_ready():
 else:
     st.sidebar.warning("Email alerts not configured — trades will still be recorded")
 paper_state = paper_trader.load_state(float(initial_cash))
+kite_alert = paper_trader.sync_kite_requirement(paper_state, require_kite_for_entry)
+if kite_alert is not None:
+    sent, detail = kite_alert
+    if sent:
+        st.sidebar.warning("Zerodha requirement is off — an email was sent to ALERT_EMAIL.")
+    else:
+        st.sidebar.error(f"Zerodha requirement is off, but the alert email failed: {detail}")
+elif not require_kite_for_entry:
+    st.sidebar.warning("Zerodha data is not required — paper entries may use delayed Yahoo prices.")
 st.sidebar.caption(
     f"Paper cash ₹{paper_state['cash']:,.2f} · "
     f"{len(paper_state['open_positions'])} open · "
     f"{len(trade_universe)} tradable · no real orders"
+)
+st.sidebar.caption(
+    f"Entries {paper_trader.ENTRY_START:%H:%M}–{paper_trader.ENTRY_END:%H:%M} IST · "
+    f"square-off {paper_trader.SQUARE_OFF:%H:%M} IST"
 )
 
 st.sidebar.markdown("---")
@@ -194,6 +207,21 @@ signals, chart_data, errors = run_scan(
     tuple(scan_symbols), interval, token_key, stop_mult, target_mult, long_only
 )
 
+kite_client_for_health = kite_client.make_kite(token_key) if token_key else None
+kite_data_ok, kite_data_reason = kite_health(kite_client_for_health)
+if kite_data_ok and signals and all(sig.data_source != "kite" for sig in signals.values()):
+    kite_data_ok = False
+    kite_data_reason = "Kite login exists, but every candle came from Yahoo Finance instead of Zerodha."
+fetch_alert = paper_trader.sync_kite_fetch(paper_state, kite_data_ok, kite_data_reason)
+if fetch_alert is not None:
+    sent, detail = fetch_alert
+    if sent:
+        st.error(f"Could not fetch Zerodha data — an email was sent to ALERT_EMAIL. {kite_data_reason}")
+    else:
+        st.error(f"Could not fetch Zerodha data ({kite_data_reason}). Alert email failed: {detail}")
+elif not kite_data_ok:
+    st.warning(f"Zerodha data is unavailable: {kite_data_reason}")
+
 rows = [
     {
         "Symbol": sig.symbol,
@@ -232,6 +260,15 @@ prices = {symbol: sig.price for symbol, sig in signals.items()}
 paper_summary = paper_trader.portfolio_summary(paper_state, prices)
 
 st.subheader("Paper portfolio — simulated money only")
+_now_ist = pd.Timestamp.now(tz="Asia/Kolkata").time()
+if status != "open":
+    st.caption(f"Market {status.replace('_', ' ')} — entries resume at {paper_trader.ENTRY_START:%H:%M} IST.")
+elif _now_ist < paper_trader.ENTRY_START:
+    st.caption(f"Waiting for the entry window to open at {paper_trader.ENTRY_START:%H:%M} IST.")
+elif _now_ist >= paper_trader.ENTRY_END:
+    st.caption(f"Entry window closed at {paper_trader.ENTRY_END:%H:%M} IST — exits only until square-off.")
+else:
+    st.caption(f"Entry window open until {paper_trader.ENTRY_END:%H:%M} IST.")
 p1, p2, p3, p4, p5 = st.columns(5)
 p1.metric("Total equity", f"₹{paper_summary['equity']:,.2f}", f"₹{paper_summary['total_pnl']:+,.2f}")
 p2.metric("Cash", f"₹{paper_summary['cash']:,.2f}")

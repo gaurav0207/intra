@@ -9,7 +9,7 @@ import json
 import math
 import os
 import smtplib
-from datetime import datetime
+from datetime import datetime, time
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
@@ -18,6 +18,13 @@ import pandas as pd
 
 STATE_PATH = Path(os.getenv("PAPER_TRADING_FILE", "paper_trades.json"))
 IST = "Asia/Kolkata"
+
+# Entries are allowed only inside this window; exits run any time the market is
+# open. Candle timestamps can lag wall clock by ~15 minutes on delayed feeds, so
+# the window is enforced against the clock as well as the candle.
+ENTRY_START = time(9, 30)
+ENTRY_END = time(15, 0)
+SQUARE_OFF = time(15, 15)
 
 
 def _now() -> str:
@@ -33,6 +40,10 @@ def new_state(initial_cash: float) -> dict[str, Any]:
         "trades": [],
         "events": [],
         "seen_entries": [],
+        "kite_requirement_alerted": False,
+        "kite_fetch_alerted": False,
+        "kite_fetch_reason": "",
+        "kite_fetch_alerted_at": "",
         "updated_at": _now(),
     }
 
@@ -50,6 +61,10 @@ def load_state(initial_cash: float = 100_000) -> dict[str, Any]:
         state.setdefault("trades", [])
         state.setdefault("events", [])
         state.setdefault("seen_entries", [])
+        state.setdefault("kite_requirement_alerted", False)
+        state.setdefault("kite_fetch_alerted", False)
+        state.setdefault("kite_fetch_reason", "")
+        state.setdefault("kite_fetch_alerted_at", "")
         state.setdefault("initial_cash", float(initial_cash))
         state.setdefault("cash", float(initial_cash))
         return state
@@ -117,6 +132,99 @@ def send_email(subject: str, body: str) -> tuple[bool, str]:
         )
     except Exception as exc:  # noqa: BLE001
         return False, str(exc)
+
+
+def sync_kite_requirement(state: dict[str, Any], require_kite: bool) -> tuple[bool, str] | None:
+    """Email ALERT_EMAIL once when Zerodha-required entries are turned off.
+
+    Returns (sent, detail) when an email is attempted, otherwise None.
+    """
+    if require_kite:
+        if state.get("kite_requirement_alerted"):
+            state["kite_requirement_alerted"] = False
+            save_state(state)
+        return None
+
+    if state.get("kite_requirement_alerted"):
+        return None
+
+    body = (
+        "Zerodha data is no longer required for new paper entries.\n\n"
+        "The dashboard will now simulate buys against delayed Yahoo Finance "
+        "prices. Fills will not match live NSE quotes. No real broker order "
+        "is placed.\n\n"
+        f"Time: {_now()}\n"
+        "Turn the setting back on in the sidebar to require Kite data again."
+    )
+    ok, detail = send_email(
+        "Paper trading: Zerodha data requirement DISABLED",
+        body,
+    )
+    state["kite_requirement_alerted"] = True
+    _record_event(
+        state,
+        {
+            "time": _now(),
+            "type": "KITE_REQUIREMENT_DISABLED",
+            "email": {"sent": ok, "detail": detail},
+        },
+    )
+    save_state(state)
+    return ok, detail
+
+
+def sync_kite_fetch(state: dict[str, Any], healthy: bool, reason: str = "") -> tuple[bool, str] | None:
+    """Email ALERT_EMAIL when Zerodha candles cannot be fetched.
+
+    Same reason is not re-sent until Kite recovers, or 4 hours pass.
+    """
+    if healthy:
+        if state.get("kite_fetch_alerted"):
+            state["kite_fetch_alerted"] = False
+            state["kite_fetch_reason"] = ""
+            state["kite_fetch_alerted_at"] = ""
+            save_state(state)
+        return None
+
+    reason = (reason or "Unknown Zerodha fetch failure").strip()
+    last_reason = str(state.get("kite_fetch_reason") or "")
+    last_at = str(state.get("kite_fetch_alerted_at") or "")
+    if state.get("kite_fetch_alerted") and last_reason == reason:
+        if last_at:
+            try:
+                age_hours = (pd.Timestamp.now(tz=IST) - pd.Timestamp(last_at)).total_seconds() / 3600
+                if age_hours < 4:
+                    return None
+            except (TypeError, ValueError):
+                return None
+        else:
+            return None
+
+    body = (
+        "The app could not fetch market data from Zerodha Kite.\n\n"
+        f"Reason: {reason}\n"
+        f"Time: {_now()}\n\n"
+        "Paper entries that require Kite data are blocked until this is fixed. "
+        "Typical causes: expired daily login, missing market-data subscription, "
+        "or insufficient API permissions.\n\n"
+        "Reconnect Kite in the sidebar, or check "
+        "https://developers.kite.trade/ for the historical/LTP permission."
+    )
+    ok, detail = send_email("Paper trading: Zerodha data fetch FAILED", body)
+    state["kite_fetch_alerted"] = True
+    state["kite_fetch_reason"] = reason
+    state["kite_fetch_alerted_at"] = _now()
+    _record_event(
+        state,
+        {
+            "time": _now(),
+            "type": "KITE_FETCH_FAILED",
+            "reason": reason,
+            "email": {"sent": ok, "detail": detail},
+        },
+    )
+    save_state(state)
+    return ok, detail
 
 
 def _record_event(state: dict[str, Any], event: dict[str, Any]) -> None:
@@ -255,9 +363,12 @@ def run_cycle(
     max_positions: int,
     minimum_confidence: int,
     require_kite: bool,
+    entry_start: time = ENTRY_START,
+    entry_end: time = ENTRY_END,
 ) -> list[dict[str, Any]]:
     """Exit existing positions, then enter the strongest eligible fresh signal."""
     events: list[dict[str, Any]] = []
+    now = pd.Timestamp.now(tz=IST).time()
 
     # Exits run even if auto-entry has been switched off.
     for symbol in list(state["open_positions"]):
@@ -276,7 +387,7 @@ def run_cycle(
             reason = "Target hit"
         elif sig.what_to_do == "EXIT NOW" or sig.score <= -2:
             reason = f"Signal reversal (score {sig.score})"
-        elif pd.Timestamp.now(tz=IST).time() >= datetime.strptime("15:15", "%H:%M").time():
+        elif now >= SQUARE_OFF:
             reason = "Intraday square-off at/after 15:15 IST"
         else:
             atr = float(bar["atr"]) if "atr" in bar and pd.notna(bar["atr"]) else 0.0
@@ -288,7 +399,7 @@ def run_cycle(
             if event:
                 events.append(event)
 
-    if not enabled or not market_open:
+    if not enabled or not market_open or not (entry_start <= now < entry_end):
         save_state(state)
         return events
 

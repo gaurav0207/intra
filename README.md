@@ -82,15 +82,37 @@ scan takes roughly 7 seconds. Stocks you hold are always scanned, even if you
 switch universes, so their exits keep working.
 
 Paper trading is enabled from the sidebar. Defaults are ₹100,000 starting
-cash, at most ₹5,000 per trade, three open positions, and 50% minimum signal
-confidence. New entries require connected Zerodha data by default; this avoids
-simulating fills against delayed Yahoo prices.
+cash, at most ₹5,000 per trade, up to 5 open positions, and 65% minimum
+signal confidence.
 
-The engine selects the strongest fresh `ENTER LONG` signal in the watchlist.
-The number of shares is `floor(maximum per trade / current price)`. Open
-positions exit automatically when the stop or target is touched, the signal
-reverses, or the intraday square-off time is reached. Disabling automatic
-paper trading stops new entries; protective exits continue.
+Entries run only between **9:30 and 15:00 IST** on weekdays, enforced against
+the clock. Exits keep running until the 15:15 square-off, so a position can
+never be stranded by the entry cut-off. New entries require Zerodha Kite data
+by default. Turning that off emails `ALERT_EMAIL` once, then allows paper
+fills against delayed Yahoo prices. The same address is emailed when Kite
+login exists but market data cannot be fetched (expired token, missing
+permissions, or empty candles). That fetch-failure mail is sent once per
+reason, then at most every four hours until Kite recovers.
+
+The engine selects the strongest fresh `ENTER LONG` signals in the trading
+universe. The number of shares is `floor(maximum per trade / current price)`.
+Open positions exit automatically when the stop or target is touched, the
+signal reverses, or square-off is reached. Disabling automatic paper trading
+stops new entries; protective exits continue.
+
+### Running it unattended
+
+Streamlit only executes while a browser session is connected, so the dashboard
+cannot trade on its own. Use the headless runner on a machine that stays awake:
+
+```bash
+python3 auto_trader.py --loop     # all day, sleeps overnight
+python3 auto_trader.py --once     # single pass, for cron
+```
+
+It shares `paper_trades.json` and the same email alerts as the dashboard.
+Flags mirror the sidebar: `--universe`, `--budget`, `--max-positions`,
+`--min-confidence`, `--every`.
 
 The complete ledger is written atomically to `paper_trades.json`, which is
 ignored by git and can also be downloaded from the app. Deleting that file

@@ -89,16 +89,11 @@ def instrument_token(kite, symbol: str) -> int:
 
 
 def fetch_ohlcv(kite, symbol: str, interval: str, lookback_days: int) -> pd.DataFrame:
-    from kiteconnect import KiteException
-
     token = instrument_token(kite, symbol)
     kite_interval = INTERVAL_MAP.get(interval, "5minute")
     now = dt.datetime.now(IST)
     start = now - dt.timedelta(days=lookback_days)
-    try:
-        records = kite.historical_data(token, start, now, kite_interval)
-    except KiteException:
-        raise
+    records = kite.historical_data(token, start, now, kite_interval)
     if not records:
         return pd.DataFrame()
 
