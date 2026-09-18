@@ -1,13 +1,15 @@
+import os
+
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 from streamlit_autorefresh import st_autorefresh
 
+import adaptive_policy
 import kite_client
 import paper_trader
 import scanner
-import universe
 from data import kite_health, market_status, next_session_label
 
 st.set_page_config(page_title="Intraday NSE Dashboard", layout="wide")
@@ -76,13 +78,11 @@ watchlist_raw = st.sidebar.text_area(
 )
 watchlist = [s.strip().upper() for s in watchlist_raw.split(",") if s.strip()]
 
-interval = st.sidebar.selectbox("Candle interval", ["1m", "5m", "15m"], index=1)
 refresh_secs = st.sidebar.slider("Auto-refresh every (seconds)", 15, 300, 60, step=15)
-
-st.sidebar.markdown("---")
-stop_mult = st.sidebar.slider("Stop-loss (x ATR)", 0.5, 3.0, 1.5, step=0.25)
-target_mult = st.sidebar.slider("Target (x ATR)", 0.5, 5.0, 2.5, step=0.25)
-long_only = st.sidebar.checkbox("Long only (NSE cash)", value=True)
+interval = "5m"
+stop_mult = 1.5
+target_mult = 2.5
+long_only = True
 
 st.sidebar.markdown("---")
 st.sidebar.title("Paper trading")
@@ -99,28 +99,16 @@ initial_cash = st.sidebar.number_input(
     step=5_000,
     disabled=paper_trader.STATE_PATH.exists(),
 )
-paper_budget = st.sidebar.number_input(
-    "Maximum per trade (₹)",
-    min_value=1_000,
-    max_value=1_000_000,
-    value=5_000,
-    step=1_000,
+trade_universe = adaptive_policy.AI_UNIVERSE
+st.sidebar.info(
+    "Adaptive mode chooses the universe, confidence, number of positions, "
+    "and rupee amount from market breadth, volatility, liquidity, and risk."
 )
-universe_name = st.sidebar.selectbox(
-    "Trading universe",
-    list(universe.UNIVERSES),
-    index=list(universe.UNIVERSES).index(universe.DEFAULT_UNIVERSE),
-    help="The stocks the app is allowed to buy. Independent of your watchlist.",
-)
-trade_universe = universe.get(universe_name)
-max_positions = st.sidebar.slider("Maximum open positions", 1, 10, 5)
-minimum_confidence = st.sidebar.slider("Minimum confidence (%)", 25, 100, 65, step=5)
-require_kite_for_entry = st.sidebar.checkbox(
-    "Require Zerodha data for new entries",
-    value=True,
-    help="On by default. Unchecking allows paper entries on delayed Yahoo prices "
-    "and emails ALERT_EMAIL once.",
-)
+require_kite_for_entry = True
+headless_executor = os.getenv("PAPER_EXECUTOR", "dashboard") == "headless"
+st.sidebar.caption("New entries require Zerodha data.")
+if headless_executor:
+    st.sidebar.success("Headless trader is responsible for entries, exits, and emails.")
 if paper_trader.email_ready():
     st.sidebar.success("Email alerts configured")
     if st.sidebar.button("Send test email"):
@@ -135,19 +123,10 @@ if paper_trader.email_ready():
 else:
     st.sidebar.warning("Email alerts not configured — trades will still be recorded")
 paper_state = paper_trader.load_state(float(initial_cash))
-kite_alert = paper_trader.sync_kite_requirement(paper_state, require_kite_for_entry)
-if kite_alert is not None:
-    sent, detail = kite_alert
-    if sent:
-        st.sidebar.warning("Zerodha requirement is off — an email was sent to ALERT_EMAIL.")
-    else:
-        st.sidebar.error(f"Zerodha requirement is off, but the alert email failed: {detail}")
-elif not require_kite_for_entry:
-    st.sidebar.warning("Zerodha data is not required — paper entries may use delayed Yahoo prices.")
 st.sidebar.caption(
     f"Paper cash ₹{paper_state['cash']:,.2f} · "
     f"{len(paper_state['open_positions'])} open · "
-    f"{len(trade_universe)} tradable · no real orders"
+    f"{len(trade_universe)} AI-scanned · no real orders"
 )
 st.sidebar.caption(
     f"Entries {paper_trader.ENTRY_START:%H:%M}–{paper_trader.ENTRY_END:%H:%M} IST · "
@@ -212,7 +191,11 @@ kite_data_ok, kite_data_reason = kite_health(kite_client_for_health)
 if kite_data_ok and signals and all(sig.data_source != "kite" for sig in signals.values()):
     kite_data_ok = False
     kite_data_reason = "Kite login exists, but every candle came from Yahoo Finance instead of Zerodha."
-fetch_alert = paper_trader.sync_kite_fetch(paper_state, kite_data_ok, kite_data_reason)
+fetch_alert = (
+    None
+    if headless_executor
+    else paper_trader.sync_kite_fetch(paper_state, kite_data_ok, kite_data_reason)
+)
 if fetch_alert is not None:
     sent, detail = fetch_alert
     if sent:
@@ -245,21 +228,37 @@ tradable_signals = {
     for sym, sig in signals.items()
     if sym in trade_universe or sym in paper_state["open_positions"]
 }
-paper_events = paper_trader.run_cycle(
-    paper_state,
-    tradable_signals,
-    chart_data,
-    enabled=paper_enabled,
-    market_open=status == "open",
-    budget_per_trade=float(paper_budget),
-    max_positions=max_positions,
-    minimum_confidence=minimum_confidence,
-    require_kite=require_kite_for_entry,
-)
 prices = {symbol: sig.price for symbol, sig in signals.items()}
+adaptive_plan = adaptive_policy.decide(paper_state, tradable_signals, chart_data, prices)
+if headless_executor:
+    paper_events = []
+    paper_state = paper_trader.load_state(float(initial_cash))
+else:
+    paper_events = paper_trader.run_cycle(
+        paper_state,
+        tradable_signals,
+        chart_data,
+        enabled=paper_enabled,
+        market_open=status == "open",
+        budget_per_trade=0,
+        max_positions=adaptive_plan.max_positions,
+        minimum_confidence=adaptive_plan.confidence_required,
+        require_kite=require_kite_for_entry,
+        candidate_budgets=adaptive_plan.candidate_budgets,
+        daily_profit_target=adaptive_plan.daily_profit_target,
+        daily_loss_limit=adaptive_plan.daily_loss_limit,
+    )
 paper_summary = paper_trader.portfolio_summary(paper_state, prices)
 
 st.subheader("Paper portfolio — simulated money only")
+st.info(
+    f"Adaptive plan: **{adaptive_plan.regime}** · "
+    f"confidence ≥ {adaptive_plan.confidence_required}% · "
+    f"up to {adaptive_plan.max_positions} positions · "
+    f"risk ₹{adaptive_plan.risk_per_trade:,.0f}/trade · "
+    f"daily objective ₹{adaptive_plan.daily_profit_target:,.0f} "
+    f"(not guaranteed) · loss stop ₹{adaptive_plan.daily_loss_limit:,.0f}"
+)
 _now_ist = pd.Timestamp.now(tz="Asia/Kolkata").time()
 if status != "open":
     st.caption(f"Market {status.replace('_', ' ')} — entries resume at {paper_trader.ENTRY_START:%H:%M} IST.")
@@ -309,7 +308,7 @@ if paper_state["open_positions"]:
         )
     st.dataframe(pd.DataFrame(position_rows), width="stretch", hide_index=True)
 else:
-    st.caption(f"No paper positions are open. Scanning {universe_name} for the next entry.")
+    st.caption("No paper positions are open. The adaptive engine is scanning its broad liquid NSE universe.")
 
 ranked = sorted(
     (
@@ -320,7 +319,10 @@ ranked = sorted(
     reverse=True,
 )[:5]
 if ranked:
-    st.caption(f"Closest candidates in {universe_name} (needs {minimum_confidence}% and a fresh ENTER LONG):")
+    st.caption(
+        f"Closest candidates (currently needs {adaptive_plan.confidence_required}% "
+        "and a fresh ENTER LONG):"
+    )
     st.dataframe(
         pd.DataFrame(
             [
@@ -331,6 +333,17 @@ if ranked:
         width="stretch",
         hide_index=True,
     )
+if adaptive_plan.selected:
+    st.success(
+        "AI-selected for the next eligible fill: "
+        + ", ".join(
+            f"{symbol} (up to ₹{adaptive_plan.candidate_budgets[symbol]:,.0f})"
+            for symbol in adaptive_plan.selected
+        )
+    )
+with st.expander("Why the adaptive engine chose these limits"):
+    for reason in adaptive_plan.explanation:
+        st.markdown(f"- {reason}")
 
 with st.expander("Paper trade history and records"):
     if paper_state["trades"]:

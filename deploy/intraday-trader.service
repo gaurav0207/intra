@@ -1,0 +1,18 @@
+[Unit]
+Description=Intraday NSE automatic paper trader (headless, no browser needed)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=intraday
+WorkingDirectory=/opt/intraday-dashboard
+EnvironmentFile=/opt/intraday-dashboard/.env
+Environment=KITE_TOKEN_FILE=/opt/intraday-dashboard/state/.kite_token
+Environment=PAPER_TRADING_FILE=/opt/intraday-dashboard/state/paper_trades.json
+ExecStart=/opt/intraday-dashboard/venv/bin/python auto_trader.py --loop
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

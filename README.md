@@ -81,9 +81,21 @@ Every symbol in the universe is scanned in parallel each refresh, so a 20-name
 scan takes roughly 7 seconds. Stocks you hold are always scanned, even if you
 switch universes, so their exits keep working.
 
-Paper trading is enabled from the sidebar. Defaults are ₹100,000 starting
-cash, at most ₹5,000 per trade, up to 5 open positions, and 65% minimum
-signal confidence.
+Paper trading is enabled from the sidebar. The starting paper account is
+₹100,000. Exposure is adaptive rather than configured with fixed defaults:
+the engine scans the broad liquid NSE universe and classifies the session as
+`RISK-ON`, `MIXED`, or `RISK-OFF`. It then chooses:
+
+- confidence threshold (60–80%);
+- maximum positions (1–5);
+- rupee amount per stock from stop distance, liquidity and 0.25–0.60% account
+  risk per trade;
+- eligible shares from signal quality and reward/risk.
+
+The daily profit objective is ₹5,000, but it is not guaranteed. If combined
+realized and open P&L reaches that amount, all positions are closed and no more
+entries are made that day. A protective daily loss stop (normally 1.5% of
+equity) does the same on the downside.
 
 Entries run only between **9:30 and 15:00 IST** on weekdays, enforced against
 the clock. Exits keep running until the 15:15 square-off, so a position can
@@ -111,8 +123,74 @@ python3 auto_trader.py --once     # single pass, for cron
 ```
 
 It shares `paper_trades.json` and the same email alerts as the dashboard.
-Flags mirror the sidebar: `--universe`, `--budget`, `--max-positions`,
-`--min-confidence`, `--every`.
+The trader emails `ALERT_EMAIL` when Kite connects or disconnects, once per
+session with today's invest plan (window, budget, closest names), when a
+fresh ENTER LONG setup appears, and instantly on each paper BUY and EXIT.
+The adaptive engine chooses universe, sizing, confidence and position count.
+Operational flags remain for `--interval`, `--every` and initial `--cash`.
+Kite data is required by default; add `--no-require-kite` to allow entries
+from delayed Yahoo prices.
+
+## Deploying on a server
+
+Streamlit Community Cloud will not work for this: it runs the script only while
+a browser session is connected, and its disk is wiped on every restart, so the
+ledger does not survive. Use a small always-on host instead. Any of these are
+enough, since the workload is one small Python process:
+
+| Host | Cost |
+|---|---|
+| Oracle Cloud Always Free (ARM VM) | free |
+| Google Cloud `e2-micro` free tier | free |
+| Hetzner CX22 | ~€4/mo |
+| DigitalOcean / Vultr / Lightsail | ~$5/mo |
+
+### Docker (recommended)
+
+Two services share one volume, so the daily Kite login done in the browser is
+picked up by the trader automatically.
+
+```bash
+git clone https://github.com/gaurav0207/intra.git
+cd intra
+cp .env.example .env        # fill in SMTP + Kite values
+docker compose up -d --build
+docker compose logs -f trader
+```
+
+The dashboard is then on port 8501 and the trader runs continuously. Both
+restart automatically if the machine reboots.
+
+### Without Docker (systemd)
+
+```bash
+sudo useradd -r -m -d /opt/intraday-dashboard intraday
+sudo -u intraday git clone https://github.com/gaurav0207/intra.git /opt/intraday-dashboard
+cd /opt/intraday-dashboard
+sudo -u intraday python3 -m venv venv
+sudo -u intraday venv/bin/pip install -r requirements.txt
+sudo -u intraday mkdir -p state
+sudo cp deploy/*.service /etc/systemd/system/
+sudo systemctl enable --now intraday-dashboard intraday-trader
+journalctl -u intraday-trader -f
+```
+
+### Daily Zerodha login
+
+Kite access tokens expire every morning. Open the dashboard on the server,
+complete the login in the sidebar, and paste the `request_token`. The token is
+written to the shared volume, so the trader picks it up on its next cycle with
+no restart needed.
+
+Do not expose port 8501 to the open internet without protection — anyone who
+reaches it can use your Kite session. Prefer an SSH tunnel:
+
+```bash
+ssh -L 8501:localhost:8501 user@your-server
+```
+
+Then use `http://localhost:8501` on your own machine. If you do want it public,
+put it behind a reverse proxy with TLS and a password.
 
 The complete ledger is written atomically to `paper_trades.json`, which is
 ignored by git and can also be downloaded from the app. Deleting that file

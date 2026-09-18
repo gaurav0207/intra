@@ -1,0 +1,24 @@
+services:
+  # Browser UI. Used for the daily Zerodha login and for watching the portfolio.
+  dashboard:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PAPER_EXECUTOR: headless
+    ports:
+      - "8501:8501"
+    volumes:
+      - state:/data
+
+  # Does the actual trading. Runs with no browser attached.
+  trader:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    command: ["python", "auto_trader.py", "--loop"]
+    volumes:
+      - state:/data
+
+volumes:
+  state:

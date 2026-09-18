@@ -18,10 +18,10 @@ import os
 import sys
 import time
 
+import adaptive_policy
 import kite_client
 import paper_trader
 import scanner
-import universe
 from data import IST, kite_health, market_status
 
 
@@ -33,14 +33,14 @@ def log(message: str) -> None:
 def _kite():
     token = kite_client.load_saved_token()
     if not token:
-        return None
+        return None, "No Zerodha Kite session (not logged in, or the token expired)."
     try:
         client = kite_client.make_kite(token)
         client.profile()
-        return client
+        return client, ""
     except Exception as exc:  # noqa: BLE001
         log(f"Kite session unusable, falling back to Yahoo: {exc}")
-        return None
+        return None, str(exc)
 
 
 def cycle(settings: dict) -> list[dict]:
@@ -49,9 +49,17 @@ def cycle(settings: dict) -> list[dict]:
     if kite_alert is not None:
         sent, detail = kite_alert
         log(f"Zerodha requirement disabled; alert email {'sent' if sent else 'failed'}: {detail}")
-    kite = _kite()
+    kite, kite_reason = _kite()
+    kite_session = kite is not None
+    conn_alert = paper_trader.sync_kite_connection(state, kite_session, kite_reason)
+    if conn_alert is not None:
+        sent, detail = conn_alert
+        log(
+            f"Kite {'CONNECTED' if kite_session else 'DISCONNECTED'}; "
+            f"email {'sent' if sent else 'failed'}: {detail}"
+        )
     kite_data_ok, kite_data_reason = kite_health(kite)
-    symbols = sorted(set(settings["universe"]) | set(state["open_positions"]))
+    symbols = sorted(set(adaptive_policy.AI_UNIVERSE) | set(state["open_positions"]))
     signals, candles, failed = scanner.scan(
         symbols,
         settings["interval"],
@@ -76,16 +84,46 @@ def cycle(settings: dict) -> list[dict]:
         log(f"No data for: {', '.join(failed)}")
 
     status = market_status()
+    prices = {sym: sig.price for sym, sig in signals.items()}
+    plan = adaptive_policy.decide(state, signals, candles, prices)
+    log(
+        f"AI plan: {plan.regime} | confidence {plan.confidence_required}% | "
+        f"max {plan.max_positions} | risk ₹{plan.risk_per_trade:,.0f}/trade | "
+        f"selected {', '.join(plan.selected) or 'none'}"
+    )
+    intents = paper_trader.notify_watch_and_intents(
+        state,
+        {
+            symbol: sig
+            for symbol, sig in signals.items()
+            if symbol in plan.candidate_budgets
+        },
+        candles,
+        budget_per_trade=max(plan.candidate_budgets.values(), default=0),
+        minimum_confidence=plan.confidence_required,
+        require_kite=settings["require_kite"],
+        kite_ok=kite_data_ok,
+        market_open=status == "open",
+        max_positions=plan.max_positions,
+        plan_notes=plan.explanation,
+        daily_profit_target=plan.daily_profit_target,
+    )
+    for ok, detail in intents:
+        log(f"Intent/plan email {'sent' if ok else 'failed'}: {detail}")
+
     events = paper_trader.run_cycle(
         state,
         signals,
         candles,
         enabled=True,
         market_open=status == "open",
-        budget_per_trade=settings["budget"],
-        max_positions=settings["max_positions"],
-        minimum_confidence=settings["min_confidence"],
+        budget_per_trade=0,
+        max_positions=plan.max_positions,
+        minimum_confidence=plan.confidence_required,
         require_kite=settings["require_kite"],
+        candidate_budgets=plan.candidate_budgets,
+        daily_profit_target=plan.daily_profit_target,
+        daily_loss_limit=plan.daily_loss_limit,
     )
 
     for event in events:
@@ -110,7 +148,7 @@ def cycle(settings: dict) -> list[dict]:
         log(f"No action ({status}). Closest: {summary}")
 
     summary = paper_trader.portfolio_summary(
-        state, {sym: sig.price for sym, sig in signals.items()}
+        state, prices
     )
     log(
         f"Equity ₹{summary['equity']:,.2f} | cash ₹{summary['cash']:,.2f} | "
@@ -132,7 +170,7 @@ def seconds_until(target: dt.time) -> float:
 def loop(settings: dict) -> None:
     log(
         f"Auto paper trading {paper_trader.ENTRY_START:%H:%M}–{paper_trader.ENTRY_END:%H:%M} IST "
-        f"on {len(settings['universe'])} stocks, every {settings['every']}s. Ctrl+C to stop."
+        f"on {len(adaptive_policy.AI_UNIVERSE)} AI-selected stocks, every {settings['every']}s. Ctrl+C to stop."
     )
     while True:
         now = dt.datetime.now(IST)
@@ -162,11 +200,7 @@ def loop(settings: dict) -> None:
 
 def build_settings(args) -> dict:
     return {
-        "universe": universe.get(args.universe),
         "interval": args.interval,
-        "budget": float(args.budget),
-        "max_positions": int(args.max_positions),
-        "min_confidence": int(args.min_confidence),
         "initial_cash": float(args.cash),
         "stop_mult": float(args.stop_mult),
         "target_mult": float(args.target_mult),
@@ -180,11 +214,7 @@ def main() -> int:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--loop", action="store_true", help="Run continuously through the session.")
     mode.add_argument("--once", action="store_true", help="Run a single scan, then exit.")
-    parser.add_argument("--universe", default=universe.DEFAULT_UNIVERSE, choices=list(universe.UNIVERSES))
     parser.add_argument("--interval", default="5m", choices=["1m", "5m", "15m"])
-    parser.add_argument("--budget", default=os.getenv("PAPER_BUDGET", "5000"))
-    parser.add_argument("--max-positions", default=os.getenv("PAPER_MAX_POSITIONS", "5"))
-    parser.add_argument("--min-confidence", default=os.getenv("PAPER_MIN_CONFIDENCE", "65"))
     parser.add_argument("--cash", default=os.getenv("PAPER_INITIAL_CASH", "100000"))
     parser.add_argument("--stop-mult", default="1.5")
     parser.add_argument("--target-mult", default="2.5")

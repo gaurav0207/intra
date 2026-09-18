@@ -17,7 +17,10 @@ except ImportError:
     pass
 
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
-TOKEN_PATH = Path(".kite_token")
+
+# Kept in a file so the Streamlit UI and the headless trader can share one
+# daily login. Point both at the same path when they run as separate services.
+TOKEN_PATH = Path(os.getenv("KITE_TOKEN_FILE", ".kite_token"))
 INTERVAL_MAP = {"1m": "minute", "5m": "5minute", "15m": "15minute", "1d": "day"}
 INDEX_KITE = "NSE:NIFTY 50"
 

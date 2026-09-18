@@ -3,6 +3,8 @@
 paper_trades.json
 paper_trades.tmp
 paper_trades.broken-*.json
+state/
+venv/
 __pycache__/
 *.pyc
 .streamlit/secrets.toml

@@ -1,0 +1,11 @@
+.git
+.github
+__pycache__
+*.pyc
+.env
+.kite_token
+paper_trades.json
+paper_trades.*.json
+venv
+deploy
+README.md
