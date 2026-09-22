@@ -16,6 +16,8 @@ from typing import Any
 
 import pandas as pd
 
+from signals import entry_side
+
 STATE_PATH = Path(os.getenv("PAPER_TRADING_FILE", "paper_trades.json"))
 IST = "Asia/Kolkata"
 
@@ -48,6 +50,8 @@ def new_state(initial_cash: float) -> dict[str, Any]:
         "seen_intents": [],
         "last_briefing_date": "",
         "last_briefing_signature": "",
+        "login_email_date": "",
+        "day_end_email_date": "",
         "updated_at": _now(),
     }
 
@@ -73,6 +77,8 @@ def load_state(initial_cash: float = 100_000) -> dict[str, Any]:
         state.setdefault("seen_intents", [])
         state.setdefault("last_briefing_date", "")
         state.setdefault("last_briefing_signature", "")
+        state.setdefault("login_email_date", "")
+        state.setdefault("day_end_email_date", "")
         state.setdefault("initial_cash", float(initial_cash))
         state.setdefault("cash", float(initial_cash))
         return state
@@ -285,6 +291,89 @@ def sync_kite_connection(
     return ok, detail
 
 
+def send_morning_login_email(
+    state: dict[str, Any],
+    login_url: str,
+    app_url: str,
+) -> tuple[bool, str] | None:
+    """Send one daily Kite login email at/after 09:30 IST."""
+    now = pd.Timestamp.now(tz=IST)
+    today = now.strftime("%Y-%m-%d")
+    if (
+        now.weekday() >= 5
+        or not (ENTRY_START <= now.time() < ENTRY_END)
+        or state.get("login_email_date") == today
+    ):
+        return None
+    body = (
+        "The NSE entry window is now open.\n\n"
+        f"1. Login to Kite: {login_url}\n"
+        f"2. Open the dashboard to confirm/add the token: {app_url or 'APP_URL is not configured'}\n\n"
+        "If the Kite developer redirect URL points to the dashboard, the request "
+        "token is captured automatically after login.\n\n"
+        f"Entries: {ENTRY_START:%H:%M}–{ENTRY_END:%H:%M} IST\n"
+        f"Square-off: {SQUARE_OFF:%H:%M} IST\n"
+        f"Time: {_now()}\nNo real broker order is placed."
+    )
+    ok, detail = send_email("[Trader] 09:30 — Login to Kite and open dashboard", body)
+    state["login_email_date"] = today
+    _record_event(
+        state,
+        {"time": _now(), "type": "MORNING_LOGIN_EMAIL", "email": {"sent": ok, "detail": detail}},
+    )
+    save_state(state)
+    return ok, detail
+
+
+def send_day_end_email(
+    state: dict[str, Any],
+    prices: dict[str, float],
+) -> tuple[bool, str] | None:
+    """Send one end-of-day summary at/after 15:15 IST."""
+    now = pd.Timestamp.now(tz=IST)
+    today = now.strftime("%Y-%m-%d")
+    if now.weekday() >= 5 or now.time() < SQUARE_OFF or state.get("day_end_email_date") == today:
+        return None
+
+    trades = [
+        t
+        for t in state.get("trades", [])
+        if t.get("exit_time")
+        and pd.Timestamp(t["exit_time"]).tz_convert(IST).strftime("%Y-%m-%d") == today
+    ]
+    realized = sum(float(t.get("pnl", 0)) for t in trades)
+    wins = sum(float(t.get("pnl", 0)) > 0 for t in trades)
+    losses = sum(float(t.get("pnl", 0)) < 0 for t in trades)
+    details = "\n".join(
+        f"- {t['symbol']} {t.get('side', 'LONG')}: "
+        f"₹{float(t.get('pnl', 0)):+,.2f} ({float(t.get('pnl_pct', 0)):+.2f}%) · "
+        f"{t.get('exit_reason', '')}"
+        for t in trades
+    ) or "- No completed trades today."
+    summary = portfolio_summary(state, prices)
+    body = (
+        "The trading day has ended. No more new entries will be taken today.\n\n"
+        f"Completed trades: {len(trades)} ({wins} wins, {losses} losses)\n"
+        f"Realized P&L today: ₹{realized:+,.2f}\n"
+        f"Account equity: ₹{summary['equity']:,.2f}\n"
+        f"Total account P&L: ₹{summary['total_pnl']:+,.2f}\n"
+        f"Open positions: {len(state.get('open_positions', {}))}\n\n"
+        f"Today's trades:\n{details}\n\n"
+        f"Time: {_now()}\nNext entry window: 09:30 IST on the next NSE weekday."
+    )
+    ok, detail = send_email(
+        f"[Trader] Day ended — P&L ₹{realized:+,.2f}",
+        body,
+    )
+    state["day_end_email_date"] = today
+    _record_event(
+        state,
+        {"time": _now(), "type": "DAY_END_EMAIL", "email": {"sent": ok, "detail": detail}},
+    )
+    save_state(state)
+    return ok, detail
+
+
 def notify_watch_and_intents(
     state: dict[str, Any],
     signals: dict[str, Any],
@@ -314,10 +403,11 @@ def notify_watch_and_intents(
     for symbol, sig in sorted(signals.items(), key=lambda kv: -kv[1].confidence):
         if symbol in state["open_positions"] or symbol not in chart_data:
             continue
-        if sig.what_to_do != "ENTER LONG NOW" or sig.confidence < minimum_confidence:
+        side = entry_side(sig)
+        if side is None or sig.confidence < minimum_confidence:
             continue
         timestamp = pd.Timestamp(chart_data[symbol].index[-1]).isoformat()
-        key = f"{symbol}|{timestamp}|INTENT"
+        key = f"{symbol}|{timestamp}|{side}|INTENT"
         if key in seen:
             continue
         qty = estimated_qty(float(sig.price))
@@ -333,7 +423,7 @@ def notify_watch_and_intents(
             blockers.append(f"already at max {max_positions} open positions")
         status = "WILL INVEST ON THIS CYCLE" if not blockers else "WATCHING — blocked: " + "; ".join(blockers)
         lines.append(
-            f"- {symbol} @ ₹{sig.price:,.2f} · ~{qty} shares · ~₹{amount:,.2f} · "
+            f"- {symbol} {side} @ ₹{sig.price:,.2f} · ~{qty} shares · ~₹{amount:,.2f} · "
             f"conf {sig.confidence}% · score {sig.score}\n"
             f"  Stop ₹{sig.stop_loss} · Target ₹{sig.target}\n"
             f"  {status}"
@@ -382,7 +472,7 @@ def notify_watch_and_intents(
             f"(currently {'connected' if kite_ok else 'not connected'})\n\n"
             + (notes + "\n\n" if notes else "")
             +
-            "It invests only on a FRESH ENTER LONG NOW signal that clears those rules.\n"
+            "It enters only on a FRESH ENTER LONG/SHORT signal that clears those rules.\n"
             "You also get an email at the exact moment it buys or exits.\n\n"
             f"Closest names right now:\n{watch_lines}\n\n"
             f"Time: {_now()}\nNo real broker order is placed."
@@ -398,7 +488,7 @@ def notify_watch_and_intents(
 
     if lines:
         body = (
-            "The trader has a live ENTER LONG setup.\n\n"
+            "The trader has a live LONG/SHORT entry setup.\n\n"
             + "\n".join(lines)
             + f"\n\nWindow: {ENTRY_START:%H:%M}–{ENTRY_END:%H:%M} IST · "
             f"Kite {'connected' if kite_ok else 'disconnected'}\n"
@@ -425,9 +515,10 @@ def _record_event(state: dict[str, Any], event: dict[str, Any]) -> None:
     state["events"] = state["events"][-1000:]
 
 
-def open_long(
+def open_position(
     state: dict[str, Any],
     symbol: str,
+    side: str,
     price: float,
     budget: float,
     stop: float,
@@ -436,6 +527,9 @@ def open_long(
     score: int,
     signal_key: str,
 ) -> dict[str, Any] | None:
+    side = side.upper()
+    if side not in {"LONG", "SHORT"}:
+        raise ValueError(f"Unsupported paper side: {side}")
     price = round(float(price), 2)
     available = min(float(budget), float(state["cash"]))
     quantity = math.floor(available / price) if price > 0 else 0
@@ -445,7 +539,7 @@ def open_long(
     amount = round(quantity * price, 2)
     position = {
         "symbol": symbol,
-        "side": "LONG",
+        "side": side,
         "entry_time": _now(),
         "entry_price": price,
         "quantity": quantity,
@@ -460,23 +554,27 @@ def open_long(
     state["open_positions"][symbol] = position
     state["seen_entries"].append(signal_key)
     state["seen_entries"] = state["seen_entries"][-500:]
-    event = {"time": _now(), "type": "BUY", **position, "cash_after": state["cash"]}
+    event_type = "BUY" if side == "LONG" else "SHORT"
+    event = {"time": _now(), "type": event_type, **position, "cash_after": state["cash"]}
     _record_event(state, event)
 
     body = (
-        f"INSTANT PAPER BUY — the trader just filled this setup.\n\n"
+        f"INSTANT PAPER {'BUY' if side == 'LONG' else 'SHORT SELL'} — "
+        "the trader just filled this setup.\n\n"
+        f"Side: {side}\n"
         f"Share: {symbol}\nPrice: ₹{price:,.2f}\nQuantity: {quantity}\n"
         f"Amount invested: ₹{amount:,.2f}\nStop-loss: ₹{position['stop']:,.2f}\n"
         f"Target: ₹{position['target']:,.2f}\nConfidence: {confidence}%\n"
         f"Cash remaining: ₹{state['cash']:,.2f}\n\nNo real broker order was placed."
     )
-    ok, detail = send_email(f"[Trader] BUY NOW: {symbol} × {quantity} @ ₹{price:,.2f}", body)
+    verb = "BUY NOW" if side == "LONG" else "SHORT NOW"
+    ok, detail = send_email(f"[Trader] {verb}: {symbol} × {quantity} @ ₹{price:,.2f}", body)
     event["email"] = {"sent": ok, "detail": detail}
     save_state(state)
     return event
 
 
-def close_long(
+def close_position(
     state: dict[str, Any],
     symbol: str,
     price: float,
@@ -488,9 +586,13 @@ def close_long(
 
     price = round(float(price), 2)
     quantity = int(position["quantity"])
-    proceeds = round(quantity * price, 2)
+    side = str(position.get("side", "LONG")).upper()
     invested = float(position["amount_invested"])
-    pnl = round(proceeds - invested, 2)
+    if side == "SHORT":
+        pnl = round((float(position["entry_price"]) - price) * quantity, 2)
+    else:
+        pnl = round((price - float(position["entry_price"])) * quantity, 2)
+    proceeds = round(invested + pnl, 2)
     pnl_pct = round((pnl / invested) * 100, 2) if invested else 0.0
     state["cash"] = round(float(state["cash"]) + proceeds, 2)
 
@@ -505,12 +607,14 @@ def close_long(
         "status": "CLOSED",
     }
     state["trades"].append(trade)
-    event = {"time": _now(), "type": "SELL", **trade, "cash_after": state["cash"]}
+    event_type = "SELL" if side == "LONG" else "COVER"
+    event = {"time": _now(), "type": event_type, **trade, "cash_after": state["cash"]}
     _record_event(state, event)
 
     result = "profit" if pnl >= 0 else "loss"
     body = (
-        f"INSTANT PAPER EXIT — the trader just closed this position.\n\n"
+        f"INSTANT PAPER EXIT — the trader just closed this {side} position.\n\n"
+        f"Side: {side}\n"
         f"Share: {symbol}\nExit price: ₹{price:,.2f}\nQuantity: {quantity}\n"
         f"Total amount received: ₹{proceeds:,.2f}\nOriginally invested: ₹{invested:,.2f}\n"
         f"Result: {result.upper()} ₹{abs(pnl):,.2f} ({pnl_pct:+.2f}%)\n"
@@ -531,7 +635,13 @@ def portfolio_summary(state: dict[str, Any], prices: dict[str, float]) -> dict[s
     unrealized = 0.0
     for symbol, position in state["open_positions"].items():
         price = float(prices.get(symbol, position["entry_price"]))
-        value = price * int(position["quantity"])
+        quantity = int(position["quantity"])
+        if str(position.get("side", "LONG")).upper() == "SHORT":
+            value = float(position["amount_invested"]) + (
+                float(position["entry_price"]) - price
+            ) * quantity
+        else:
+            value = price * quantity
         market_value += value
         unrealized += value - float(position["amount_invested"])
     realized = sum(float(t.get("pnl", 0)) for t in state["trades"])
@@ -557,8 +667,29 @@ def today_pnl(state: dict[str, Any], prices: dict[str, float]) -> float:
     unrealized = 0.0
     for symbol, position in state.get("open_positions", {}).items():
         price = float(prices.get(symbol, position["entry_price"]))
-        unrealized += price * int(position["quantity"]) - float(position["amount_invested"])
+        quantity = int(position["quantity"])
+        if str(position.get("side", "LONG")).upper() == "SHORT":
+            unrealized += (float(position["entry_price"]) - price) * quantity
+        else:
+            unrealized += price * quantity - float(position["amount_invested"])
     return round(realized + unrealized, 2)
+
+
+def _already_exited_this_move(state: dict[str, Any], symbol: str, sig: Any) -> bool:
+    """True when we already closed this symbol today and the signal is still
+    holding the same move, so re-entering would just repeat the trade we left."""
+    entered_at = getattr(sig, "entered_at", None)
+    if not entered_at:
+        return False
+    today = pd.Timestamp.now(tz=IST).strftime("%Y-%m-%d")
+    for trade in reversed(state.get("trades", [])):
+        if trade.get("symbol") != symbol or not trade.get("exit_time"):
+            continue
+        stamp = pd.Timestamp(trade["exit_time"]).tz_convert(IST)
+        if stamp.strftime("%Y-%m-%d") != today:
+            continue
+        return entered_at <= stamp.strftime("%H:%M")
+    return False
 
 
 def run_cycle(
@@ -590,23 +721,42 @@ def run_cycle(
         bar = chart_data[symbol].iloc[-1]
         fill = float(bar["close"])
         reason = None
-        if float(bar["low"]) <= float(position["stop"]):
+        side = str(position.get("side", "LONG")).upper()
+        stop_hit = (
+            float(bar["low"]) <= float(position["stop"])
+            if side == "LONG"
+            else float(bar["high"]) >= float(position["stop"])
+        )
+        target_hit = (
+            float(bar["high"]) >= float(position["target"])
+            if side == "LONG"
+            else float(bar["low"]) <= float(position["target"])
+        )
+        reversal = (
+            sig.score <= -2
+            if side == "LONG"
+            else sig.score >= 2
+        )
+        if stop_hit:
             fill = float(position["stop"])
             reason = "Stop-loss hit"
-        elif float(bar["high"]) >= float(position["target"]):
+        elif target_hit:
             fill = float(position["target"])
             reason = "Target hit"
-        elif sig.what_to_do == "EXIT NOW" or sig.score <= -2:
+        elif sig.what_to_do == "EXIT NOW" or reversal:
             reason = f"Signal reversal (score {sig.score})"
         elif now >= SQUARE_OFF:
             reason = "Intraday square-off at/after 15:15 IST"
         else:
             atr = float(bar["atr"]) if "atr" in bar and pd.notna(bar["atr"]) else 0.0
             if atr > 0:
-                position["stop"] = round(max(float(position["stop"]), fill - 1.5 * atr), 2)
+                if side == "LONG":
+                    position["stop"] = round(max(float(position["stop"]), fill - 1.5 * atr), 2)
+                else:
+                    position["stop"] = round(min(float(position["stop"]), fill + 1.5 * atr), 2)
 
         if reason:
-            event = close_long(state, symbol, fill, reason)
+            event = close_position(state, symbol, fill, reason)
             if event:
                 events.append(event)
 
@@ -623,7 +773,7 @@ def run_cycle(
         for symbol in list(state["open_positions"]):
             if symbol not in prices:
                 continue
-            event = close_long(state, symbol, prices[symbol], reason)
+            event = close_position(state, symbol, prices[symbol], reason)
             if event:
                 events.append(event)
         save_state(state)
@@ -644,25 +794,30 @@ def run_cycle(
             continue
         if symbol in state["open_positions"] or symbol not in chart_data:
             continue
+        side = entry_side(sig)
+        if side is None:
+            continue
         timestamp = pd.Timestamp(chart_data[symbol].index[-1]).isoformat()
-        signal_key = f"{symbol}|{timestamp}|LONG"
+        signal_key = f"{symbol}|{timestamp}|{side}"
         if signal_key in state["seen_entries"]:
             continue
+        if _already_exited_this_move(state, symbol, sig):
+            continue
         if (
-            sig.what_to_do == "ENTER LONG NOW"
-            and sig.confidence >= minimum_confidence
+            sig.confidence >= minimum_confidence
             and (not require_kite or sig.data_source == "kite")
             and sig.stop_loss is not None
             and sig.target is not None
         ):
-            candidates.append((sig.confidence, sig.score, symbol, signal_key))
+            candidates.append((sig.confidence, abs(sig.score), symbol, side, signal_key))
 
     candidates.sort(reverse=True)
-    for _, _, symbol, signal_key in candidates[:slots]:
+    for _, _, symbol, side, signal_key in candidates[:slots]:
         sig = signals[symbol]
-        event = open_long(
+        event = open_position(
             state,
             symbol,
+            side,
             sig.price,
             (
                 float(candidate_budgets[symbol])

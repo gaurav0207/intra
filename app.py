@@ -27,6 +27,27 @@ if not api_key:
 else:
     st.sidebar.caption(f"API key `{api_key[:4]}…{api_key[-4:]}`")
 
+# If Kite redirects back to this deployed dashboard, exchange the request token
+# automatically so the user only has to click the morning email link and login.
+redirect_request_token = st.query_params.get("request_token")
+if redirect_request_token and api_key and not st.session_state.kite_token:
+    secret_from_env = kite_client.api_secret()
+    if secret_from_env:
+        try:
+            session = kite_client.exchange_request_token(
+                str(redirect_request_token),
+                secret_from_env,
+                api_key,
+            )
+            st.session_state.kite_token = session["access_token"]
+            st.query_params.clear()
+            st.success("Kite login completed. The headless trader will connect on its next cycle.")
+            st.rerun()
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Automatic Kite login failed: {exc}")
+    else:
+        st.warning("Kite redirected successfully, but KITE_API_SECRET is not configured.")
+
 kite_ok = False
 kite = None
 if st.session_state.kite_token:
@@ -82,7 +103,7 @@ refresh_secs = st.sidebar.slider("Auto-refresh every (seconds)", 15, 300, 60, st
 interval = "5m"
 stop_mult = 1.5
 target_mult = 2.5
-long_only = True
+long_only = False
 
 st.sidebar.markdown("---")
 st.sidebar.title("Paper trading")
@@ -277,9 +298,9 @@ p5.metric("Open P&L", f"₹{paper_summary['unrealized_pnl']:+,.2f}")
 
 if paper_events:
     for event in paper_events:
-        if event["type"] == "BUY":
+        if event["type"] in {"BUY", "SHORT"}:
             st.success(
-                f"Paper BUY: {event['symbol']} · {event['quantity']} shares @ "
+                f"Paper {event['type']}: {event['symbol']} · {event['quantity']} shares @ "
                 f"₹{event['entry_price']:,.2f} · invested ₹{event['amount_invested']:,.2f}"
             )
         else:
@@ -292,10 +313,14 @@ if paper_state["open_positions"]:
     position_rows = []
     for symbol, position in paper_state["open_positions"].items():
         current = float(prices.get(symbol, position["entry_price"]))
-        pnl = current * position["quantity"] - position["amount_invested"]
+        if position.get("side", "LONG") == "SHORT":
+            pnl = (position["entry_price"] - current) * position["quantity"]
+        else:
+            pnl = current * position["quantity"] - position["amount_invested"]
         position_rows.append(
             {
                 "Share": symbol,
+                "Side": position.get("side", "LONG"),
                 "Shares": position["quantity"],
                 "Entry": position["entry_price"],
                 "Current": round(current, 2),
@@ -337,8 +362,9 @@ if adaptive_plan.selected:
     st.success(
         "AI-selected for the next eligible fill: "
         + ", ".join(
-            f"{symbol} (up to ₹{adaptive_plan.candidate_budgets[symbol]:,.0f})"
-            for symbol in adaptive_plan.selected
+            f"{symbol} {adaptive_plan.candidate_sides[symbol]} "
+            f"(up to ₹{adaptive_plan.candidate_budgets[symbol]:,.0f})"
+            for symbol in adaptive_plan.candidate_budgets
         )
     )
 with st.expander("Why the adaptive engine chose these limits"):

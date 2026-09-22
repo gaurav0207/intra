@@ -92,6 +92,11 @@ the engine scans the broad liquid NSE universe and classifies the session as
   risk per trade;
 - eligible shares from signal quality and reward/risk.
 
+The engine can hold LONG and SHORT paper positions at the same time. In
+`RISK-ON` it favours longs; in `RISK-OFF` it favours shorts; in `MIXED` it can
+take either side. Shorts are simulations of intraday short selling—the app
+still never submits a real broker order.
+
 The daily profit objective is ₹5,000, but it is not guaranteed. If combined
 realized and open P&L reaches that amount, all positions are closed and no more
 entries are made that day. A protective daily loss stop (normally 1.5% of
@@ -125,7 +130,7 @@ python3 auto_trader.py --once     # single pass, for cron
 It shares `paper_trades.json` and the same email alerts as the dashboard.
 The trader emails `ALERT_EMAIL` when Kite connects or disconnects, once per
 session with today's invest plan (window, budget, closest names), when a
-fresh ENTER LONG setup appears, and instantly on each paper BUY and EXIT.
+fresh LONG/SHORT setup appears, and instantly on each paper BUY/SHORT and EXIT.
 The adaptive engine chooses universe, sizing, confidence and position count.
 Operational flags remain for `--interval`, `--every` and initial `--cash`.
 Kite data is required by default; add `--no-require-kite` to allow entries
@@ -161,6 +166,25 @@ docker compose logs -f trader
 The dashboard is then on port 8501 and the trader runs continuously. Both
 restart automatically if the machine reboots.
 
+For a public HTTPS deployment with password protection, point a domain at the
+server, set `DOMAIN`, `APP_URL`, `DASHBOARD_USER` and
+`DASHBOARD_PASSWORD_HASH` in `.env`, then use:
+
+```bash
+docker compose -f compose.cloud.yml up -d --build
+```
+
+Generate the Caddy password hash with:
+
+```bash
+docker run --rm caddy:2 caddy hash-password --plaintext 'your-password'
+```
+
+Escape each `$` as `$$` when pasting the hash into `.env`. Set the Kite
+developer redirect URL to exactly the same HTTPS `APP_URL`. At 09:30 IST the
+trader emails the Kite login link and app link; after login, Kite redirects to
+the dashboard and the request token is exchanged automatically.
+
 ### Without Docker (systemd)
 
 ```bash
@@ -177,10 +201,14 @@ journalctl -u intraday-trader -f
 
 ### Daily Zerodha login
 
-Kite access tokens expire every morning. Open the dashboard on the server,
-complete the login in the sidebar, and paste the `request_token`. The token is
-written to the shared volume, so the trader picks it up on its next cycle with
-no restart needed.
+Kite access tokens expire every morning. At 09:30 IST the trader sends a login
+email. Click its Kite link and complete login. If the Kite redirect URL matches
+`APP_URL`, the dashboard captures and exchanges `request_token` automatically.
+The token is written to the shared volume, so the trader picks it up on its
+next cycle without restarting.
+
+At 15:15 IST it sends a day-ended email confirming there are no further
+entries, with completed trades, wins/losses, realized P&L and account equity.
 
 Do not expose port 8501 to the open internet without protection — anyone who
 reaches it can use your Kite session. Prefer an SSH tunnel:

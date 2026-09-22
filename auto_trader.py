@@ -66,7 +66,7 @@ def cycle(settings: dict) -> list[dict]:
         kite=kite,
         stop_mult=settings["stop_mult"],
         target_mult=settings["target_mult"],
-        long_only=True,
+        long_only=False,
     )
     if kite_data_ok and signals and all(sig.data_source != "kite" for sig in signals.values()):
         kite_data_ok = False
@@ -154,6 +154,10 @@ def cycle(settings: dict) -> list[dict]:
         f"Equity ₹{summary['equity']:,.2f} | cash ₹{summary['cash']:,.2f} | "
         f"realized ₹{summary['realized_pnl']:+,.2f} | open ₹{summary['unrealized_pnl']:+,.2f}"
     )
+    day_end = paper_trader.send_day_end_email(state, prices)
+    if day_end is not None:
+        sent, detail = day_end
+        log(f"Day-end email {'sent' if sent else 'failed'}: {detail}")
     return events
 
 
@@ -174,6 +178,27 @@ def loop(settings: dict) -> None:
     )
     while True:
         now = dt.datetime.now(IST)
+        state = paper_trader.load_state(settings["initial_cash"])
+        try:
+            login_url = kite_client.login_url()
+        except Exception as exc:  # noqa: BLE001
+            login_url = f"Unable to create Kite login URL: {exc}"
+        morning = paper_trader.send_morning_login_email(
+            state,
+            login_url,
+            os.getenv("APP_URL", "").strip(),
+        )
+        if morning is not None:
+            sent, detail = morning
+            log(f"09:30 login email {'sent' if sent else 'failed'}: {detail}")
+
+        # Send the summary even if the process restarted after market close.
+        if now.time() >= dt.time(15, 30):
+            end = paper_trader.send_day_end_email(state, {})
+            if end is not None:
+                sent, detail = end
+                log(f"Day-end email {'sent' if sent else 'failed'}: {detail}")
+
         status = market_status()
         if status != "open":
             wait = seconds_until(dt.time(9, 15))

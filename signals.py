@@ -17,6 +17,10 @@ import pandas as pd
 from data import next_session_label
 from indicators import enrich_context
 
+# Fraction of the entry-to-target move that may already be gone before opening
+# a held setup counts as chasing rather than entering.
+MAX_HOLD_ENTRY_PROGRESS = 0.5
+
 
 @dataclass
 class Signal:
@@ -46,6 +50,30 @@ class Signal:
     tomorrow_session: str = ""
     confidence: int = 0
     data_source: str = "yahoo"
+
+
+def entry_side(sig: "Signal") -> Optional[str]:
+    """Return LONG/SHORT if this signal may be opened now, else None.
+
+    ``ENTER ... NOW`` prints only on the single bar where the setup fires, so a
+    scan landing one bar later would skip the whole move. A HOLD that still has
+    most of its move left is therefore entry-eligible too, measured as progress
+    from the entry price towards the target rather than by clock time.
+    """
+    action = sig.what_to_do
+    if action in {"ENTER LONG NOW", "ENTER SHORT NOW"}:
+        return "SHORT" if "SHORT" in action else "LONG"
+    if action not in {"HOLD LONG", "HOLD SHORT"}:
+        return None
+    if sig.entry is None or sig.target is None:
+        return None
+    side = "SHORT" if "SHORT" in action else "LONG"
+    entry, target, price = float(sig.entry), float(sig.target), float(sig.price)
+    span = target - entry if side == "LONG" else entry - target
+    captured = price - entry if side == "LONG" else entry - price
+    if span <= 0 or captured / span > MAX_HOLD_ENTRY_PROGRESS:
+        return None
+    return side
 
 
 def _has(row: pd.Series, col: str) -> bool:

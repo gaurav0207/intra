@@ -1,0 +1,38 @@
+services:
+  dashboard:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PAPER_EXECUTOR: headless
+    expose:
+      - "8501"
+    volumes:
+      - state:/data
+
+  trader:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    command: ["python", "auto_trader.py", "--loop"]
+    volumes:
+      - state:/data
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - dashboard
+
+volumes:
+  state:
+  caddy_data:
+  caddy_config:
