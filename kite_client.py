@@ -59,6 +59,15 @@ def clear_token() -> None:
         TOKEN_PATH.unlink()
 
 
+# Only these mean the daily login itself is dead. The token file is shared with
+# the headless trader, so a network blip or rate limit must never delete it.
+FATAL_SESSION_ERRORS = {"TokenException", "PermissionException"}
+
+
+def is_session_dead(exc: BaseException) -> bool:
+    return type(exc).__name__ in FATAL_SESSION_ERRORS
+
+
 def exchange_request_token(request_token: str, secret: str, key: str | None = None) -> dict:
     from kiteconnect import KiteConnect
 

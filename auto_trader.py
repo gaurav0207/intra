@@ -88,7 +88,8 @@ def cycle(settings: dict) -> list[dict]:
     plan = adaptive_policy.decide(state, signals, candles, prices)
     log(
         f"AI plan: {plan.regime} | confidence {plan.confidence_required}% | "
-        f"max {plan.max_positions} | risk ₹{plan.risk_per_trade:,.0f}/trade | "
+        f"max {plan.max_positions} | deploy ₹{sum(plan.candidate_budgets.values()):,.0f} | "
+        f"projected target P&L ₹{plan.projected_profit:,.0f} | "
         f"selected {', '.join(plan.selected) or 'none'}"
     )
     intents = paper_trader.notify_watch_and_intents(
@@ -107,6 +108,7 @@ def cycle(settings: dict) -> list[dict]:
         max_positions=plan.max_positions,
         plan_notes=plan.explanation,
         daily_profit_target=plan.daily_profit_target,
+        plan_signature=plan.regime,
     )
     for ok, detail in intents:
         log(f"Intent/plan email {'sent' if ok else 'failed'}: {detail}")
@@ -127,14 +129,14 @@ def cycle(settings: dict) -> list[dict]:
     )
 
     for event in events:
-        if event["type"] == "BUY":
+        if event["type"] in {"BUY", "SHORT"}:
             log(
-                f"BUY  {event['symbol']} x{event['quantity']} @ ₹{event['entry_price']:,.2f} "
+                f"{event['type']:5s} {event['symbol']} x{event['quantity']} @ ₹{event['entry_price']:,.2f} "
                 f"= ₹{event['amount_invested']:,.2f} (stop {event['stop']}, target {event['target']})"
             )
         else:
             log(
-                f"SELL {event['symbol']} @ ₹{event['exit_price']:,.2f} "
+                f"{event['type']:5s} {event['symbol']} @ ₹{event['exit_price']:,.2f} "
                 f"= ₹{event['proceeds']:,.2f} | P&L ₹{event['pnl']:+,.2f} ({event['pnl_pct']:+.2f}%) "
                 f"| {event['exit_reason']}"
             )

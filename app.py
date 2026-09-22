@@ -61,9 +61,12 @@ if st.session_state.kite_token:
             st.session_state.kite_token = None
             st.rerun()
     except Exception as exc:  # noqa: BLE001
-        st.sidebar.warning(f"Kite token expired or invalid: {exc}")
-        kite_client.clear_token()
-        st.session_state.kite_token = None
+        if kite_client.is_session_dead(exc):
+            st.sidebar.warning(f"Kite login expired, log in again: {exc}")
+            kite_client.clear_token()
+            st.session_state.kite_token = None
+        else:
+            st.sidebar.warning(f"Kite unreachable, keeping the session: {exc}")
         kite = None
 
 if not kite_ok:

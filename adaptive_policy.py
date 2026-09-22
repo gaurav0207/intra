@@ -17,6 +17,9 @@ from signals import entry_side
 
 DAILY_PROFIT_TARGET = 5_000.0
 
+# Ceiling on concurrent open paper positions, in every regime.
+MAX_OPEN_POSITIONS = 5
+
 # ATR band for one intraday candle, not a daily range: a 5-minute NSE large-cap
 # bar typically moves 0.10-0.20% of price, so a daily-scale floor rejects the
 # whole universe. The ceiling still keeps gapping, news-driven names out.
@@ -36,6 +39,7 @@ class AdaptivePlan:
     risk_per_trade: float
     daily_profit_target: float
     daily_loss_limit: float
+    projected_profit: float = 0.0
     candidate_budgets: dict[str, float] = field(default_factory=dict)
     candidate_sides: dict[str, str] = field(default_factory=dict)
     selected: list[str] = field(default_factory=list)
@@ -72,18 +76,18 @@ def decide(
 
     if bull_breadth >= 0.45 and bull_breadth - bear_breadth >= 0.15:
         regime = "RISK-ON"
-        confidence = 60 if strong >= 0.30 else 65
-        max_positions = 5
+        confidence = 55 if strong >= 0.30 else 60
+        max_positions = MAX_OPEN_POSITIONS
         risk_fraction = 0.006
     elif bear_breadth >= 0.45:
         regime = "RISK-OFF"
-        confidence = 70
-        max_positions = 2
+        confidence = 65
+        max_positions = MAX_OPEN_POSITIONS
         risk_fraction = 0.003
     else:
         regime = "MIXED"
-        confidence = 65
-        max_positions = 3
+        confidence = 60
+        max_positions = MAX_OPEN_POSITIONS
         risk_fraction = 0.004
 
     risk_per_trade = max(100.0, equity * risk_fraction)
@@ -91,7 +95,8 @@ def decide(
     available_cash = float(state.get("cash", 0))
     slots = max(max_positions - len(state.get("open_positions", {})), 0)
 
-    ranked: list[tuple[float, str, str, float]] = []
+    # quality, symbol, side, price, stop distance, reward per share
+    ranked: list[tuple[float, str, str, float, float, float]] = []
     for symbol, sig in signals.items():
         if symbol in state.get("open_positions", {}) or symbol not in candles:
             continue
@@ -120,30 +125,57 @@ def decide(
         if stop_distance < 0.25 * atr:
             continue
 
-        qty_by_risk = math.floor(risk_per_trade / stop_distance)
-        concentration_cap = equity * (0.12 if regime == "RISK-ON" else 0.08)
-        qty_by_cap = math.floor(min(concentration_cap, available_cash) / price)
-        qty = min(qty_by_risk, qty_by_cap)
-        if qty < 1:
-            continue
-        budget = round(qty * price, 2)
         quality = sig.confidence + min(reward / stop_distance, 3) * 5 + min(traded_value / 100_000_000, 5)
         # Prefer the side aligned with the breadth regime, but both are valid.
         if (regime == "RISK-ON" and side == "LONG") or (regime == "RISK-OFF" and side == "SHORT"):
             quality += 8
-        ranked.append((quality, symbol, side, budget))
+        ranked.append((quality, symbol, side, price, stop_distance, reward))
 
     ranked.sort(reverse=True)
     selected_rows = ranked[:slots]
-    budgets = {symbol: budget for _, symbol, _, budget in selected_rows}
-    sides = {symbol: side for _, symbol, side, _ in selected_rows}
 
     today = pd.Timestamp.now(tz="Asia/Kolkata").strftime("%Y-%m-%d")
     realized = _daily_realized(state, today)
+    remaining_target = max(DAILY_PROFIT_TARGET - realized, 0.0)
+
+    # Size from the requested output first. If the capital needed to earn the
+    # remaining target at each setup's stated target exceeds available cash,
+    # deploy all available paper cash across the best setups. This deliberately
+    # removes the old 8-12% concentration cap; stop-losses and the daily loss
+    # limit remain the downside controls.
+    required_budgets: dict[str, float] = {}
+    if selected_rows:
+        profit_share = remaining_target / len(selected_rows)
+        for _, symbol, _, price, _, reward in selected_rows:
+            reward_pct = reward / price
+            required_budgets[symbol] = profit_share / reward_pct
+
+    # Reserve capital for the slots that are still free, so a setup firing now
+    # cannot swallow the cash that later setups need. With five free slots any
+    # single entry takes at most a fifth of the cash, which is what keeps the
+    # position cap meaningful instead of ending up concentrated in one name.
+    per_slot_cap = available_cash / slots if slots else 0.0
+
+    budgets: dict[str, float] = {}
+    projected_profit = 0.0
+    cash_left = available_cash
+    for _, symbol, _, price, _, reward in selected_rows:
+        alloc = min(required_budgets[symbol], per_slot_cap, cash_left)
+        qty = math.floor(alloc / price)
+        if qty < 1:
+            continue
+        budget = round(qty * price, 2)
+        budgets[symbol] = budget
+        cash_left -= budget
+        projected_profit += qty * reward
+
+    sides = {symbol: side for _, symbol, side, _, _, _ in selected_rows if symbol in budgets}
     explanation = [
         f"Breadth: {bull_breadth:.0%} bullish, {bear_breadth:.0%} bearish.",
         f"{regime} requires {confidence}% confidence and allows {max_positions} positions.",
-        f"Risk budget per trade: ₹{risk_per_trade:,.0f}; daily loss stop: ₹{daily_loss_limit:,.0f}.",
+        f"Deploying up to ₹{sum(budgets.values()):,.0f} toward selected targets; "
+        f"projected target profit ₹{projected_profit:,.0f}.",
+        f"Daily loss stop: ₹{daily_loss_limit:,.0f}.",
         f"Today's realized P&L: ₹{realized:+,.2f}; profit objective: ₹{DAILY_PROFIT_TARGET:,.0f}.",
     ]
     return AdaptivePlan(
@@ -153,8 +185,9 @@ def decide(
         risk_per_trade=round(risk_per_trade, 2),
         daily_profit_target=DAILY_PROFIT_TARGET,
         daily_loss_limit=round(daily_loss_limit, 2),
+        projected_profit=round(projected_profit, 2),
         candidate_budgets=budgets,
         candidate_sides=sides,
-        selected=[f"{symbol} {side}" for _, symbol, side, _ in selected_rows],
+        selected=[f"{symbol} {side}" for _, symbol, side, _, _, _ in selected_rows if symbol in budgets],
         explanation=explanation,
     )

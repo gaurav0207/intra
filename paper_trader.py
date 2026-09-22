@@ -386,6 +386,7 @@ def notify_watch_and_intents(
     max_positions: int,
     plan_notes: list[str] | None = None,
     daily_profit_target: float | None = None,
+    plan_signature: str | None = None,
 ) -> list[tuple[bool, str]]:
     """Email what the trader is about to buy, without repeating the same setup."""
     sent_results: list[tuple[bool, str]] = []
@@ -430,13 +431,17 @@ def notify_watch_and_intents(
         )
         new_keys.append(key)
 
+    # Live breadth, P&L and projected amounts change every scan. They belong in
+    # the email body, but not in its identity; otherwise each small market move
+    # sends another "session briefing". A new briefing is sent only once at
+    # session start or when the actual policy/regime changes.
     briefing_signature = "|".join(
         [
             today,
+            plan_signature or "",
             str(minimum_confidence),
             str(max_positions),
             str(round(float(daily_profit_target or 0), 2)),
-            *(plan_notes or []),
         ]
     )
     if (
