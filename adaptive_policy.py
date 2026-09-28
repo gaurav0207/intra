@@ -12,6 +12,7 @@ from typing import Any
 
 import pandas as pd
 
+import live_kite
 import paper_trader
 import universe
 from options import OptionContract
@@ -108,6 +109,8 @@ def decide(
     risk_per_trade = max(100.0, equity * risk_fraction)
     daily_loss_limit = max(DAILY_PROFIT_TARGET, equity * 0.025)
     available_cash = float(state.get("cash", 0))
+    if live_kite.is_enabled(state):
+        available_cash = min(available_cash, live_kite.remaining_capital(state))
     slots = max(max_positions - len(state.get("open_positions", {})), 0)
 
     # quality, symbol, side, contract
@@ -156,18 +159,21 @@ def decide(
     today = pd.Timestamp.now(tz="Asia/Kolkata").strftime("%Y-%m-%d")
     realized = _daily_realized(state, today)
     remaining_target = max(DAILY_PROFIT_TARGET - realized, 0.0)
+    per_slot_cap = available_cash / slots if slots else 0.0
 
     required_budgets: dict[str, float] = {}
     if selected_rows:
-        profit_share = remaining_target / len(selected_rows)
-        for _, symbol, _, contract in selected_rows:
-            reward = contract.target - contract.premium
-            reward_pct = reward / contract.premium if contract.premium else 0.0
-            if reward_pct <= 0:
-                continue
-            required_budgets[symbol] = profit_share / reward_pct
-
-    per_slot_cap = available_cash / slots if slots else 0.0
+        if remaining_target > 0:
+            profit_share = remaining_target / len(selected_rows)
+            for _, symbol, _, contract in selected_rows:
+                reward = contract.target - contract.premium
+                reward_pct = reward / contract.premium if contract.premium else 0.0
+                if reward_pct <= 0:
+                    continue
+                required_budgets[symbol] = profit_share / reward_pct
+        else:
+            for _, symbol, _, contract in selected_rows:
+                required_budgets[symbol] = per_slot_cap
 
     budgets: dict[str, float] = {}
     chosen: dict[str, OptionContract] = {}
@@ -194,8 +200,14 @@ def decide(
         f"Deploying up to ₹{sum(budgets.values()):,.0f} of option premium; "
         f"projected target profit ₹{projected_profit:,.0f}.",
         f"Daily loss stop: ₹{daily_loss_limit:,.0f}.",
-        f"Today's realized P&L: ₹{realized:+,.2f}; profit objective: ₹{DAILY_PROFIT_TARGET:,.0f}.",
+        f"Today's realized P&L: ₹{realized:+,.2f}; profit objective ₹{DAILY_PROFIT_TARGET:,.0f} "
+        f"(guides sizing only — no hard stop).",
     ]
+    if live_kite.is_enabled(state):
+        explanation.append(
+            f"Live Zerodha cap: ₹{live_kite.capital_limit():,.0f} premium max · "
+            f"₹{live_kite.remaining_capital(state):,.0f} free now."
+        )
     return AdaptivePlan(
         regime=regime,
         confidence_required=confidence,

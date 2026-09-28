@@ -154,11 +154,15 @@ def cycle(settings: dict) -> list[dict]:
     if halt:
         log(f"Session halt active — no new entries: {halt}")
 
+    auto_on = bool(state.get("auto_trading_enabled", True))
+    if not auto_on:
+        log("Automatic trading is OFF (dashboard switch) — new entries skipped; exits still run.")
+
     events = paper_trader.run_cycle(
         state,
         signals,
         candles,
-        enabled=True,
+        enabled=auto_on,
         market_open=status == "open",
         budget_per_trade=0,
         max_positions=plan.max_positions,

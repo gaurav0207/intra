@@ -8,6 +8,7 @@ from streamlit_autorefresh import st_autorefresh
 
 import adaptive_policy
 import kite_client
+import live_kite
 import options
 import paper_trader
 import scanner
@@ -112,11 +113,6 @@ long_only = False
 
 st.sidebar.markdown("---")
 st.sidebar.title("Paper trading")
-paper_enabled = st.sidebar.toggle(
-    "Automatic paper trading",
-    value=True,
-    help="Simulates trades only. This never sends a Zerodha order.",
-)
 initial_cash = st.sidebar.number_input(
     "Starting paper cash (₹)",
     min_value=5_000,
@@ -149,10 +145,42 @@ if paper_trader.email_ready():
 else:
     st.sidebar.warning("Email alerts not configured — trades will still be recorded")
 paper_state = paper_trader.load_state(float(initial_cash))
+
+_auto_saved = bool(paper_state.get("auto_trading_enabled", True))
+_live_saved = bool(paper_state.get("live_trading_enabled", False))
+auto_trading = st.sidebar.toggle(
+    "Automatic trading",
+    value=_auto_saved,
+    help="Default ON. When OFF, the headless bot will not open new positions. "
+    "Stop/target exits and manual exits still work.",
+)
+live_trading = st.sidebar.toggle(
+    "Real Zerodha orders",
+    value=_live_saved,
+    help="When ON, paper BUY/EXIT is mirrored to your Zerodha account (₹50k premium cap). "
+    "Default OFF.",
+)
+if auto_trading != _auto_saved or live_trading != _live_saved:
+    paper_state["auto_trading_enabled"] = auto_trading
+    paper_state["live_trading_enabled"] = live_trading
+    paper_trader.save_state(paper_state)
+
+if not auto_trading:
+    st.sidebar.warning("Automatic trading OFF — no new entries until you turn this on.")
+if live_trading:
+    st.sidebar.error(
+        "Real Zerodha orders ON. You can lose money. "
+        f"Cap ₹{live_kite.capital_limit():,.0f} · "
+        f"deployed ₹{live_kite.deployed_premium(paper_state):,.0f} · "
+        f"free ₹{live_kite.remaining_capital(paper_state):,.0f}"
+    )
+else:
+    st.sidebar.caption(live_kite.status_line(paper_state))
+
 st.sidebar.caption(
     f"Paper cash ₹{paper_state['cash']:,.2f} · "
     f"{len(paper_state['open_positions'])} open · "
-    f"{len(trade_universe)} underlyings · NFO options · no real orders"
+    f"{len(trade_universe)} underlyings · NFO options"
 )
 st.sidebar.caption(
     f"Entries {paper_trader.ENTRY_START:%H:%M}–{paper_trader.ENTRY_END:%H:%M} IST · "
@@ -290,7 +318,7 @@ else:
         paper_state,
         tradable_signals,
         chart_data,
-        enabled=paper_enabled,
+        enabled=bool(paper_state.get("auto_trading_enabled", True)),
         market_open=status == "open",
         budget_per_trade=0,
         max_positions=adaptive_plan.max_positions,
@@ -305,12 +333,19 @@ else:
 paper_summary = paper_trader.portfolio_summary(paper_state, prices)
 
 st.subheader("Paper portfolio — simulated NFO options only")
+if not paper_state.get("auto_trading_enabled", True):
+    st.warning(
+        "Automatic trading is **OFF** (sidebar). The bot will not open new positions; "
+        "exits and manual closes still work."
+    )
+if live_kite.is_enabled(paper_state):
+    st.error("Real Zerodha mirroring is **ON** — paper fills also send live NFO orders.")
 st.info(
     f"Adaptive plan: **{adaptive_plan.regime}** · "
     f"confidence ≥ {adaptive_plan.confidence_required}% · "
     f"up to {adaptive_plan.max_positions} option positions · "
     f"daily objective ₹{adaptive_plan.daily_profit_target:,.0f} "
-    f"(not guaranteed) · loss stop ₹{adaptive_plan.daily_loss_limit:,.0f}"
+    f"(sizing guide, no hard stop) · loss stop ₹{adaptive_plan.daily_loss_limit:,.0f}"
 )
 _now_ist = pd.Timestamp.now(tz="Asia/Kolkata").time()
 if status != "open":
@@ -408,6 +443,53 @@ if paper_state["open_positions"]:
             }
         )
     st.dataframe(pd.DataFrame(position_rows), width="stretch", hide_index=True)
+    st.markdown("**Manual exit (paper only)**")
+    st.caption(
+        "Uses the latest option premium shown above. You get the same instant EXIT email as the auto trader. "
+        "No real Zerodha order is placed."
+    )
+    exit_all_col, _ = st.columns([1, 3])
+    with exit_all_col:
+        exit_all = st.button(
+            "Exit all open positions",
+            type="primary",
+            key="manual_exit_all",
+        )
+    if exit_all:
+        exited = paper_trader.manual_exit_positions(
+            None,
+            prices,
+            float(paper_state.get("initial_cash", initial_cash)),
+        )
+        if exited:
+            for event in exited:
+                label = event.get("contract") or event["symbol"]
+                st.success(
+                    f"Exited {label} @ ₹{event['exit_price']:,.2f} · "
+                    f"P&L ₹{event['pnl']:+,.2f}"
+                )
+            st.rerun()
+        else:
+            st.warning("Nothing to exit — reload the page if a position just closed.")
+    per_row = st.columns(min(3, len(paper_state["open_positions"])))
+    for idx, (symbol, position) in enumerate(paper_state["open_positions"].items()):
+        label = position.get("contract") or symbol
+        with per_row[idx % len(per_row)]:
+            if st.button(f"Exit {label}", key=f"manual_exit_{symbol}"):
+                exited = paper_trader.manual_exit_positions(
+                    [symbol],
+                    prices,
+                    float(paper_state.get("initial_cash", initial_cash)),
+                )
+                if exited:
+                    event = exited[0]
+                    st.success(
+                        f"Exited {label} @ ₹{event['exit_price']:,.2f} · "
+                        f"P&L ₹{event['pnl']:+,.2f}"
+                    )
+                    st.rerun()
+                else:
+                    st.warning("Could not exit — the position may already be closed.")
 else:
     st.caption("No paper option positions are open.")
 

@@ -16,6 +16,7 @@ from typing import Any
 
 import pandas as pd
 
+import live_kite
 from signals import entry_side
 
 STATE_PATH = Path(os.getenv("PAPER_TRADING_FILE", "paper_trades.json"))
@@ -52,6 +53,8 @@ def new_state(initial_cash: float) -> dict[str, Any]:
         "last_briefing_signature": "",
         "login_email_date": "",
         "day_end_email_date": "",
+        "auto_trading_enabled": True,
+        "live_trading_enabled": False,
         "updated_at": _now(),
     }
 
@@ -79,6 +82,8 @@ def load_state(initial_cash: float = 100_000) -> dict[str, Any]:
         state.setdefault("last_briefing_signature", "")
         state.setdefault("login_email_date", "")
         state.setdefault("day_end_email_date", "")
+        state.setdefault("auto_trading_enabled", True)
+        state.setdefault("live_trading_enabled", False)
         state.setdefault("initial_cash", float(initial_cash))
         state.setdefault("cash", float(initial_cash))
         return state
@@ -547,7 +552,7 @@ def notify_watch_and_intents(
             f"Budget per trade: ₹{float(budget_per_trade):,.0f}\n"
             f"Minimum confidence: {minimum_confidence}%\n"
             f"Daily profit objective: ₹{float(daily_profit_target or 0):,.0f} "
-            "(objective, not guaranteed)\n"
+            "(sizes entries toward this; trading does not stop when reached)\n"
             f"Kite required: {'yes' if require_kite else 'no'} "
             f"(currently {'connected' if kite_ok else 'not connected'})\n\n"
             + (notes + "\n\n" if notes else "")
@@ -659,8 +664,38 @@ def open_position(
         "expiry": contract.expiry,
         "instrument_token": int(contract.instrument_token),
     }
+    live_note = ""
+    live_result: dict[str, Any] | None = None
+    if live_kite.is_enabled(state):
+        live_result = live_kite.mirror_entry(state, position)
+        if not live_result.get("ok"):
+            send_email(
+                "[Trader] LIVE order FAILED (paper entry cancelled)",
+                f"Contract: {contract.tradingsymbol}\n"
+                f"Error: {live_result.get('error')}\n\n"
+                "Paper book was NOT updated because live mirroring is strict.",
+            )
+            return None
+        position["live_kite_entry"] = live_result
+        cap_note = live_result.get("cap_note") or ""
+        live_note = (
+            f"\n\nLIVE ZERODHA ORDER PLACED\n"
+            f"Order ID: {live_result.get('order_id')}\n"
+            f"Limit: ₹{live_result.get('limit_price'):,.2f} · qty {live_result.get('quantity')}\n"
+            + (f"{cap_note}\n" if cap_note else "")
+        )
+
+    lots = int(position["lots"])
+    quantity = int(position["quantity"])
+    amount = round(float(position["amount_invested"]), 2)
+
+    broker_line = (
+        "Mirrored to your Zerodha account (see LIVE section below)."
+        if live_kite.is_enabled(state)
+        else "No real broker order is placed."
+    )
     body = (
-        f"INSTANT PAPER OPTION BUY — debit only, no cash shares, no real broker order.\n\n"
+        f"INSTANT PAPER OPTION BUY — debit only, no cash shares.\n\n"
         f"Underlying: {symbol}\n"
         f"Contract: {contract.tradingsymbol}\n"
         f"Type: {side}  Strike: {contract.strike:g}  Expiry: {contract.expiry}\n"
@@ -668,6 +703,7 @@ def open_position(
         f"Premium paid: ₹{amount:,.2f}\nStop: ₹{position['stop']:,.2f}\n"
         f"Target: ₹{position['target']:,.2f}\nConfidence: {confidence}%\n"
         f"Cash remaining: ₹{round(float(state['cash']) - amount, 2):,.2f}\n"
+        f"{broker_line}{live_note}"
     )
 
     state["cash"] = round(float(state["cash"]) - amount, 2)
@@ -675,14 +711,36 @@ def open_position(
     state["seen_entries"].append(signal_key)
     state["seen_entries"] = state["seen_entries"][-500:]
     event = {"time": _now(), "type": "BUY", **position, "cash_after": state["cash"]}
+    if live_result:
+        event["live_kite"] = live_result
     _record_event(state, event)
-    ok, detail = send_email(
-        f"[Trader] BUY {side}: {contract.tradingsymbol} × {lots} @ ₹{price:,.2f}",
-        body,
-    )
+    subject = f"[Trader] BUY {side}: {contract.tradingsymbol} × {lots} @ ₹{price:,.2f}"
+    if live_result:
+        subject = f"[Trader] LIVE+BUY {side}: {contract.tradingsymbol} × {lots}"
+    ok, detail = send_email(subject, body)
     event["email"] = {"sent": ok, "detail": detail}
     save_state(state)
     return event
+
+
+def manual_exit_positions(
+    symbols: list[str] | None,
+    prices: dict[str, float],
+    initial_cash: float,
+    reason: str = "Manual exit from dashboard",
+) -> list[dict[str, Any]]:
+    """Close one or all open paper positions at current marks (no broker order)."""
+    state = load_state(initial_cash)
+    targets = list(symbols) if symbols else list(state["open_positions"])
+    events: list[dict[str, Any]] = []
+    for symbol in targets:
+        if symbol not in state["open_positions"]:
+            continue
+        mark = position_mark(symbol, state["open_positions"][symbol], prices)
+        event = close_position(state, symbol, mark, reason)
+        if event:
+            events.append(event)
+    return events
 
 
 def close_position(
@@ -724,7 +782,34 @@ def close_position(
     event = {"time": _now(), "type": event_type, **trade, "cash_after": state["cash"]}
     _record_event(state, event)
 
+    live_result: dict[str, Any] | None = None
+    live_note = ""
+    if live_kite.is_enabled(state) and position.get("contract"):
+        live_result = live_kite.mirror_exit(position, price)
+        if live_result.get("ok"):
+            trade["live_kite_exit"] = live_result
+            live_note = (
+                f"\n\nLIVE ZERODHA EXIT ORDER\n"
+                f"Order ID: {live_result.get('order_id')}\n"
+                f"Limit: ₹{live_result.get('limit_price'):,.2f}\n"
+            )
+        else:
+            live_note = (
+                f"\n\nLIVE ZERODHA EXIT FAILED — check Kite positions manually!\n"
+                f"Error: {live_result.get('error')}\n"
+            )
+            send_email(
+                "[Trader] LIVE EXIT FAILED — manual action needed",
+                f"Paper exit completed for {position.get('contract') or symbol} but "
+                f"Zerodha SELL failed:\n{live_result.get('error')}",
+            )
+
     result = "profit" if pnl >= 0 else "loss"
+    broker_line = (
+        "Exit mirrored to Zerodha when live mirroring is on."
+        if live_kite.is_enabled(state)
+        else "No real broker order was placed."
+    )
     body = (
         f"INSTANT PAPER EXIT — the trader just closed this {side} position.\n\n"
         f"Side: {side}\n"
@@ -732,13 +817,15 @@ def close_position(
         f"Total amount received: ₹{proceeds:,.2f}\nOriginally invested: ₹{invested:,.2f}\n"
         f"Result: {result.upper()} ₹{abs(pnl):,.2f} ({pnl_pct:+.2f}%)\n"
         f"Reason: {reason}\nPaper cash after exit: ₹{state['cash']:,.2f}\n\n"
-        f"No real broker order was placed."
+        f"{broker_line}{live_note}"
     )
     ok, detail = send_email(
         f"[Trader] EXIT NOW: {symbol} | {result} ₹{abs(pnl):,.2f}",
         body,
     )
     event["email"] = {"sent": ok, "detail": detail}
+    if live_result:
+        event["live_kite"] = live_result
     save_state(state)
     return event
 
@@ -777,13 +864,11 @@ def trading_halt_reason(
     daily_profit_target: float | None,
     daily_loss_limit: float | None,
 ) -> str | None:
-    """Why new option entries are blocked for the rest of this session."""
+    """Why new option entries are blocked for the rest of this session.
+
+    The daily profit figure is a sizing objective only — hitting it does not halt trading.
+    """
     session_pnl = today_pnl(state, prices)
-    if daily_profit_target is not None and session_pnl >= float(daily_profit_target):
-        return (
-            f"daily profit objective reached (today ₹{session_pnl:+,.0f}; "
-            f"target ₹{float(daily_profit_target):,.0f})"
-        )
     if daily_loss_limit is not None and session_pnl <= -float(daily_loss_limit):
         return (
             f"daily loss limit reached (today ₹{session_pnl:+,.0f}; "
