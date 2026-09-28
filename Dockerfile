@@ -4,7 +4,8 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     TZ=Asia/Kolkata \
     KITE_TOKEN_FILE=/data/.kite_token \
-    PAPER_TRADING_FILE=/data/paper_trades.json
+    PAPER_TRADING_FILE=/data/paper_trades.json \
+    NFO_CACHE_FILE=/data/nfo_instruments.json
 
 WORKDIR /app
 

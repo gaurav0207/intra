@@ -1,8 +1,8 @@
 """The trading universe the app scans on its own.
 
 This is deliberately separate from the sidebar watchlist. The watchlist is for
-looking at charts; these lists are what the paper trader is allowed to buy.
-Names are liquid NSE cash-segment stocks, chosen so intraday spreads stay tight.
+looking at charts; these lists are the underlyings whose NFO options the paper
+trader may buy.
 """
 
 from __future__ import annotations
@@ -32,6 +32,12 @@ HIGH_BETA = [
     "ADANIPORTS", "VEDL", "SAIL", "IDFCFIRSTB", "PNB",
     "BANKBARODA", "CANBK", "IEX", "RBLBANK", "ETERNAL",
 ]
+
+INDEX_UNDERLYINGS = ["NIFTY", "BANKNIFTY"]
+
+# Cash names that also have liquid NFO stock options. The paper book scans the
+# underlying, then buys the matching ATM call or put.
+FNO_UNDERLYINGS = INDEX_UNDERLYINGS + NIFTY_50
 
 UNIVERSES: dict[str, list[str]] = {
     "Liquid 20 (default)": LIQUID_20,

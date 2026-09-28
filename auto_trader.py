@@ -20,9 +20,11 @@ import time
 
 import adaptive_policy
 import kite_client
+import options
 import paper_trader
 import scanner
 from data import IST, kite_health, market_status
+from signals import entry_side
 
 
 def log(message: str) -> None:
@@ -83,9 +85,39 @@ def cycle(settings: dict) -> list[dict]:
     if failed:
         log(f"No data for: {', '.join(failed)}")
 
+    wanted: dict[str, tuple[str, float]] = {}
+    for symbol, sig in signals.items():
+        side = entry_side(sig)
+        if side is None:
+            continue
+        wanted[symbol] = (side, float(sig.price))
+    top = sorted(wanted, key=lambda s: -signals[s].confidence)[:12]
+    contracts = options.resolve_many(kite, {s: wanted[s] for s in top}) if kite else {}
+    if wanted and not contracts:
+        log("No NFO ATM contracts resolved (need a live Kite session for options).")
+    elif contracts:
+        log(
+            "Options mapped: "
+            + ", ".join(f"{c.tradingsymbol} @ ₹{c.premium}" for c in list(contracts.values())[:8])
+        )
+
+    option_marks: dict[str, float] = {}
+    open_contracts = [
+        pos["contract"]
+        for pos in state["open_positions"].values()
+        if pos.get("contract")
+    ]
+    if kite and open_contracts:
+        ltps = options.fetch_option_ltps(kite, open_contracts)
+        for symbol, pos in state["open_positions"].items():
+            last = ltps.get(pos.get("contract", ""))
+            if last:
+                option_marks[symbol] = last
+
     status = market_status()
     prices = {sym: sig.price for sym, sig in signals.items()}
-    plan = adaptive_policy.decide(state, signals, candles, prices)
+    prices.update(option_marks)
+    plan = adaptive_policy.decide(state, signals, candles, prices, contracts=contracts)
     log(
         f"AI plan: {plan.regime} | confidence {plan.confidence_required}% | "
         f"max {plan.max_positions} | deploy ₹{sum(plan.candidate_budgets.values()):,.0f} | "
@@ -109,9 +141,18 @@ def cycle(settings: dict) -> list[dict]:
         plan_notes=plan.explanation,
         daily_profit_target=plan.daily_profit_target,
         plan_signature=plan.regime,
+        candidate_contracts=plan.candidate_contracts,
+        candidate_budgets=plan.candidate_budgets,
+        daily_loss_limit=plan.daily_loss_limit,
     )
     for ok, detail in intents:
         log(f"Intent/plan email {'sent' if ok else 'failed'}: {detail}")
+
+    halt = paper_trader.trading_halt_reason(
+        state, prices, plan.daily_profit_target, plan.daily_loss_limit
+    )
+    if halt:
+        log(f"Session halt active — no new entries: {halt}")
 
     events = paper_trader.run_cycle(
         state,
@@ -124,14 +165,18 @@ def cycle(settings: dict) -> list[dict]:
         minimum_confidence=plan.confidence_required,
         require_kite=settings["require_kite"],
         candidate_budgets=plan.candidate_budgets,
+        candidate_contracts=plan.candidate_contracts,
+        option_marks=option_marks,
         daily_profit_target=plan.daily_profit_target,
         daily_loss_limit=plan.daily_loss_limit,
     )
 
     for event in events:
         if event["type"] in {"BUY", "SHORT"}:
+            label = event.get("contract") or event["symbol"]
             log(
-                f"{event['type']:5s} {event['symbol']} x{event['quantity']} @ ₹{event['entry_price']:,.2f} "
+                f"{event['type']:5s} {label} x{event.get('lots', event['quantity'])} "
+                f"@ ₹{event['entry_price']:,.2f} "
                 f"= ₹{event['amount_invested']:,.2f} (stop {event['stop']}, target {event['target']})"
             )
         else:
@@ -147,7 +192,10 @@ def cycle(settings: dict) -> list[dict]:
     if not events:
         best = sorted(signals.values(), key=lambda s: -s.confidence)[:3]
         summary = ", ".join(f"{s.symbol} {s.confidence}% {s.what_to_do}" for s in best)
-        log(f"No action ({status}). Closest: {summary}")
+        if halt:
+            log(f"No action ({status}). {halt}. Closest: {summary}")
+        else:
+            log(f"No action ({status}). Closest: {summary}")
 
     summary = paper_trader.portfolio_summary(
         state, prices
@@ -175,8 +223,8 @@ def seconds_until(target: dt.time) -> float:
 
 def loop(settings: dict) -> None:
     log(
-        f"Auto paper trading {paper_trader.ENTRY_START:%H:%M}–{paper_trader.ENTRY_END:%H:%M} IST "
-        f"on {len(adaptive_policy.AI_UNIVERSE)} AI-selected stocks, every {settings['every']}s. Ctrl+C to stop."
+        f"Auto paper trading OPTIONS {paper_trader.ENTRY_START:%H:%M}–{paper_trader.ENTRY_END:%H:%M} IST "
+        f"on {len(adaptive_policy.AI_UNIVERSE)} underlyings (ATM CE/PE), every {settings['every']}s. Ctrl+C to stop."
     )
     while True:
         now = dt.datetime.now(IST)

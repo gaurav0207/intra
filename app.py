@@ -8,9 +8,11 @@ from streamlit_autorefresh import st_autorefresh
 
 import adaptive_policy
 import kite_client
+import options
 import paper_trader
 import scanner
 from data import kite_health, market_status, next_session_label
+from signals import entry_side
 
 st.set_page_config(page_title="Intraday NSE Dashboard", layout="wide")
 
@@ -125,12 +127,12 @@ initial_cash = st.sidebar.number_input(
 )
 trade_universe = adaptive_policy.AI_UNIVERSE
 st.sidebar.info(
-    "Adaptive mode chooses the universe, confidence, number of positions, "
-    "and rupee amount from market breadth, volatility, liquidity, and risk."
+    "Paper book buys ATM NFO calls/puts on the scanned underlyings. "
+    "LONG → CE, SHORT → PE. No cash-share entries."
 )
 require_kite_for_entry = True
 headless_executor = os.getenv("PAPER_EXECUTOR", "dashboard") == "headless"
-st.sidebar.caption("New entries require Zerodha data.")
+st.sidebar.caption("New entries buy ATM NFO options only. Cash shares are never opened.")
 if headless_executor:
     st.sidebar.success("Headless trader is responsible for entries, exits, and emails.")
 if paper_trader.email_ready():
@@ -150,7 +152,7 @@ paper_state = paper_trader.load_state(float(initial_cash))
 st.sidebar.caption(
     f"Paper cash ₹{paper_state['cash']:,.2f} · "
     f"{len(paper_state['open_positions'])} open · "
-    f"{len(trade_universe)} AI-scanned · no real orders"
+    f"{len(trade_universe)} underlyings · NFO options · no real orders"
 )
 st.sidebar.caption(
     f"Entries {paper_trader.ENTRY_START:%H:%M}–{paper_trader.ENTRY_END:%H:%M} IST · "
@@ -175,7 +177,7 @@ status_label = {
     "closed_weekend": ("🔴 Market closed (weekend)", "red"),
 }[status]
 
-st.title("📈 Intraday NSE Dashboard")
+st.title("📈 Intraday NFO Options Dashboard")
 c1, c2, c3 = st.columns([1, 2, 2])
 c1.markdown(f"**{status_label[0]}**")
 c2.caption(f"Last updated: {pd.Timestamp.now(tz='Asia/Kolkata').strftime('%H:%M:%S IST')}")
@@ -253,7 +255,33 @@ tradable_signals = {
     if sym in trade_universe or sym in paper_state["open_positions"]
 }
 prices = {symbol: sig.price for symbol, sig in signals.items()}
-adaptive_plan = adaptive_policy.decide(paper_state, tradable_signals, chart_data, prices)
+wanted = {}
+for sym, sig in tradable_signals.items():
+    side = entry_side(sig)
+    if side is not None:
+        wanted[sym] = (side, float(sig.price))
+contracts = {}
+if kite_client_for_health:
+    ranked_wanted = sorted(wanted, key=lambda s: -tradable_signals[s].confidence)[:12]
+    contracts = options.resolve_many(
+        kite_client_for_health, {s: wanted[s] for s in ranked_wanted}
+    )
+option_marks: dict[str, float] = {}
+open_contracts = [
+    pos["contract"]
+    for pos in paper_state["open_positions"].values()
+    if pos.get("contract")
+]
+if kite_client_for_health and open_contracts:
+    ltps = options.fetch_option_ltps(kite_client_for_health, open_contracts)
+    for symbol, pos in paper_state["open_positions"].items():
+        last = ltps.get(pos.get("contract", ""))
+        if last:
+            option_marks[symbol] = last
+            prices[symbol] = last
+adaptive_plan = adaptive_policy.decide(
+    paper_state, tradable_signals, chart_data, prices, contracts=contracts
+)
 if headless_executor:
     paper_events = []
     paper_state = paper_trader.load_state(float(initial_cash))
@@ -269,17 +297,18 @@ else:
         minimum_confidence=adaptive_plan.confidence_required,
         require_kite=require_kite_for_entry,
         candidate_budgets=adaptive_plan.candidate_budgets,
+        candidate_contracts=adaptive_plan.candidate_contracts,
+        option_marks=option_marks,
         daily_profit_target=adaptive_plan.daily_profit_target,
         daily_loss_limit=adaptive_plan.daily_loss_limit,
     )
 paper_summary = paper_trader.portfolio_summary(paper_state, prices)
 
-st.subheader("Paper portfolio — simulated money only")
+st.subheader("Paper portfolio — simulated NFO options only")
 st.info(
     f"Adaptive plan: **{adaptive_plan.regime}** · "
     f"confidence ≥ {adaptive_plan.confidence_required}% · "
-    f"up to {adaptive_plan.max_positions} positions · "
-    f"risk ₹{adaptive_plan.risk_per_trade:,.0f}/trade · "
+    f"up to {adaptive_plan.max_positions} option positions · "
     f"daily objective ₹{adaptive_plan.daily_profit_target:,.0f} "
     f"(not guaranteed) · loss stop ₹{adaptive_plan.daily_loss_limit:,.0f}"
 )
@@ -303,8 +332,9 @@ if paper_events:
     for event in paper_events:
         if event["type"] in {"BUY", "SHORT"}:
             st.success(
-                f"Paper {event['type']}: {event['symbol']} · {event['quantity']} shares @ "
-                f"₹{event['entry_price']:,.2f} · invested ₹{event['amount_invested']:,.2f}"
+                f"Paper {event['type']}: {event.get('contract', event['symbol'])} · "
+                f"{event.get('lots', event['quantity'])} lots @ "
+                f"₹{event['entry_price']:,.2f} · premium ₹{event['amount_invested']:,.2f}"
             )
         else:
             st.info(
@@ -312,22 +342,65 @@ if paper_events:
                 f"P&L ₹{event['pnl']:+,.2f} ({event['pnl_pct']:+.2f}%)"
             )
 
+session_halt = paper_trader.trading_halt_reason(
+    paper_state,
+    prices,
+    adaptive_plan.daily_profit_target,
+    adaptive_plan.daily_loss_limit,
+)
+plan_rows = paper_state.get("last_option_plan") or []
+if adaptive_plan.candidate_contracts:
+    plan_rows = paper_trader.option_plan_rows(
+        paper_state,
+        tradable_signals,
+        adaptive_plan.candidate_contracts,
+        adaptive_plan.candidate_budgets,
+        chart_data=chart_data,
+        minimum_confidence=adaptive_plan.confidence_required,
+        max_positions=adaptive_plan.max_positions,
+        in_window=status == "open",
+        kite_ok=kite_data_ok,
+        daily_profit_target=adaptive_plan.daily_profit_target,
+        daily_loss_limit=adaptive_plan.daily_loss_limit,
+        prices=prices,
+    )
+st.subheader("Will buy next — NFO options only")
+if session_halt:
+    st.warning(f"No new option entries this session: {session_halt}.")
+if plan_rows:
+    show = pd.DataFrame(plan_rows)
+    drop = [c for c in show.columns if str(c).startswith("_")]
+    st.dataframe(show.drop(columns=drop, errors="ignore"), width="stretch", hide_index=True)
+    if paper_state.get("last_option_plan_at"):
+        st.caption(f"Last plan from the headless trader: {paper_state['last_option_plan_at']}")
+else:
+    st.caption("No ATM option is sized for a fill on this cycle.")
+
 if paper_state["open_positions"]:
     position_rows = []
     for symbol, position in paper_state["open_positions"].items():
-        current = float(prices.get(symbol, position["entry_price"]))
-        if position.get("side", "LONG") == "SHORT":
+        current = float(position["entry_price"])
+        if position.get("contract"):
+            mark = float(prices.get(symbol, position["entry_price"]))
+            entry = float(position["entry_price"])
+            current = entry if mark > max(entry * 8, entry + 50) else mark
+        else:
+            current = float(prices.get(symbol, position["entry_price"]))
+        if position.get("contract") or position.get("side") in {"CE", "PE"}:
+            pnl = (current - position["entry_price"]) * position["quantity"]
+        elif position.get("side", "LONG") == "SHORT":
             pnl = (position["entry_price"] - current) * position["quantity"]
         else:
             pnl = current * position["quantity"] - position["amount_invested"]
         position_rows.append(
             {
-                "Share": symbol,
-                "Side": position.get("side", "LONG"),
-                "Shares": position["quantity"],
-                "Entry": position["entry_price"],
-                "Current": round(current, 2),
-                "Invested": position["amount_invested"],
+                "Contract": position.get("contract", symbol),
+                "Underlying": symbol,
+                "Type": position.get("side", "LONG"),
+                "Lots": position.get("lots", position["quantity"]),
+                "Premium in": position["entry_price"],
+                "Premium now": round(current, 2),
+                "Paid": position["amount_invested"],
                 "Stop": position["stop"],
                 "Target": position["target"],
                 "Open P&L": round(pnl, 2),
@@ -336,7 +409,7 @@ if paper_state["open_positions"]:
         )
     st.dataframe(pd.DataFrame(position_rows), width="stretch", hide_index=True)
 else:
-    st.caption("No paper positions are open. The adaptive engine is scanning its broad liquid NSE universe.")
+    st.caption("No paper option positions are open.")
 
 ranked = sorted(
     (
@@ -348,8 +421,8 @@ ranked = sorted(
 )[:5]
 if ranked:
     st.caption(
-        f"Closest candidates (currently needs {adaptive_plan.confidence_required}% "
-        "and a fresh ENTER LONG):"
+        f"Underlying scan only (not the fill list). Needs {adaptive_plan.confidence_required}% "
+        "and a mapped ATM CE/PE before it appears above:"
     )
     st.dataframe(
         pd.DataFrame(

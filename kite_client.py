@@ -23,6 +23,7 @@ IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 TOKEN_PATH = Path(os.getenv("KITE_TOKEN_FILE", ".kite_token"))
 INTERVAL_MAP = {"1m": "minute", "5m": "5minute", "15m": "15minute", "1d": "day"}
 INDEX_KITE = "NSE:NIFTY 50"
+BANKNIFTY_KITE = "NSE:NIFTY BANK"
 
 
 def api_key() -> str:
@@ -89,6 +90,10 @@ def _nse_tradingsymbol(symbol: str) -> str:
     symbol = symbol.strip().upper().replace(".NS", "").replace(".BO", "")
     if symbol in {"NIFTY", "NIFTY50", "NIFTY 50"}:
         return INDEX_KITE
+    if symbol in {"BANKNIFTY", "NIFTY BANK"}:
+        return BANKNIFTY_KITE
+    if symbol.startswith("NFO:"):
+        return symbol
     return f"NSE:{symbol}"
 
 

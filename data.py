@@ -20,6 +20,8 @@ def to_nse_symbol(symbol: str) -> str:
     symbol = symbol.strip().upper()
     if symbol in {"NIFTY", "NIFTY50", "NIFTY 50"}:
         return INDEX_YF
+    if symbol in {"BANKNIFTY", "NIFTY BANK"}:
+        return "^NSEBANK"
     if not symbol.endswith(".NS") and not symbol.endswith(".BO"):
         symbol += ".NS"
     return symbol

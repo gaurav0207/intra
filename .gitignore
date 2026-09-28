@@ -1,5 +1,6 @@
 .env
 .kite_token
+.nfo_instruments.json
 paper_trades.json
 paper_trades.tmp
 paper_trades.broken-*.json
