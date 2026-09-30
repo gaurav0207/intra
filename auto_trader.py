@@ -23,6 +23,7 @@ import kite_client
 import live_kite
 import trading_policy
 import kite_ws
+import open_auction
 import options
 import paper_trader
 import scanner
@@ -65,6 +66,8 @@ def cycle(settings: dict) -> list[dict]:
             f"email {'sent' if sent else 'failed'}: {detail}"
         )
     kite_data_ok, kite_data_reason = kite_health(kite)
+    if kite is not None:
+        kite_ws.start()
     symbols = sorted(set(adaptive_policy.AI_UNIVERSE) | set(state["open_positions"]))
     signals, candles, failed = scanner.scan(
         symbols,
@@ -105,6 +108,7 @@ def cycle(settings: dict) -> list[dict]:
         wanted[symbol] = (side, float(sig.price))
     top = sorted(wanted, key=lambda s: -signals[s].confidence)[:12]
     contracts = options.resolve_many(kite, {s: wanted[s] for s in top}) if kite else {}
+    options.apply_live_premiums(contracts)
     if wanted and not contracts:
         log(
             "No NFO ATM contracts resolved (Kite session, DTE window, or illiquid premium)."
@@ -122,7 +126,6 @@ def cycle(settings: dict) -> list[dict]:
         if pos.get("contract")
     ]
     if kite:
-        kite_ws.start()
         ws_tokens = [
             int(pos["instrument_token"])
             for pos in state["open_positions"].values()
@@ -154,7 +157,9 @@ def cycle(settings: dict) -> list[dict]:
     status = market_status()
     prices = {sym: sig.price for sym, sig in signals.items()}
     prices.update(option_marks)
+    options.apply_live_premiums(contracts)
     plan = adaptive_policy.decide(state, signals, candles, prices, contracts=contracts)
+    options.apply_live_premiums(plan.candidate_contracts)
     log(
         f"AI plan: {plan.regime} | confidence {plan.confidence_required}% | "
         f"max {plan.max_positions} | deploy ₹{sum(plan.candidate_budgets.values()):,.0f} | "
@@ -270,6 +275,76 @@ def cycle(settings: dict) -> list[dict]:
     return events
 
 
+def _option_marks_from_state(state: dict) -> dict[str, float]:
+    marks: dict[str, float] = {}
+    token_map = {
+        pos["contract"]: int(pos["instrument_token"])
+        for pos in state["open_positions"].values()
+        if pos.get("contract") and pos.get("instrument_token")
+    }
+    symbols = [pos["contract"] for pos in state["open_positions"].values() if pos.get("contract")]
+    if not symbols:
+        return marks
+    ltps = options.fetch_option_ltps(None, symbols, instrument_tokens=token_map)
+    for symbol, pos in state["open_positions"].items():
+        last = ltps.get(pos.get("contract", ""))
+        if last:
+            marks[symbol] = last
+    return marks
+
+
+def run_open_auction(settings: dict) -> list[dict]:
+    """Fast 09:15–09:30 path: tape entries + premium exits, no 5m universe scan."""
+    state = paper_trader.load_state()
+    kite, kite_reason = _kite()
+    if kite is not None:
+        kite_ws.start()
+    plan = open_auction.ensure_plan(state, kite)
+    log(
+        f"Open auction armed: {len(plan)} ATM name(s) · {open_auction.summary_line()}"
+        + (f" · kite {kite_reason}" if kite is None else "")
+    )
+    if plan:
+        log(
+            "Watching "
+            + ", ".join(
+                f"{r['tradingsymbol']} ({r['bias']}, prev ₹{r.get('prev_premium') or 0:.2f})"
+                for r in plan[:8]
+            )
+        )
+    events = open_auction.try_entries(state, kite)
+    state = paper_trader.load_state()
+    marks = _option_marks_from_state(state)
+    exits = paper_trader.run_cycle(
+        state,
+        {},
+        {},
+        enabled=False,
+        market_open=True,
+        budget_per_trade=0,
+        max_positions=0,
+        minimum_confidence=100,
+        require_kite=settings["require_kite"],
+        option_marks=marks,
+    )
+    events.extend(exits)
+    for event in events:
+        label = event.get("contract") or event.get("symbol")
+        if event.get("type") in {"BUY", "SHORT"}:
+            log(
+                f"OPEN {event.get('side')} {label} @ ₹{event.get('entry_price'):,.2f} "
+                f"· {event.get('open_auction_reason') or 'tape'}"
+            )
+        elif event.get("type") in {"COVER", "EXIT", "SELL"}:
+            log(
+                f"EXIT {label} @ ₹{event.get('exit_price', 0):,.2f} "
+                f"| {event.get('exit_reason')}"
+            )
+    if not events:
+        log("Open auction: no tape fill this pass.")
+    return events
+
+
 def seconds_until(target: dt.time) -> float:
     now = dt.datetime.now(IST)
     nxt = now.replace(hour=target.hour, minute=target.minute, second=0, microsecond=0)
@@ -283,7 +358,8 @@ def seconds_until(target: dt.time) -> float:
 def loop(settings: dict) -> None:
     log(
         f"Auto paper trading OPTIONS {paper_trader.ENTRY_START:%H:%M}–{paper_trader.ENTRY_END:%H:%M} IST "
-        f"on {len(adaptive_policy.AI_UNIVERSE)} underlyings (ATM CE/PE), every {settings['every']}s. Ctrl+C to stop."
+        f"on {len(adaptive_policy.AI_UNIVERSE)} underlyings (ATM CE/PE), every {settings['every']}s. "
+        f"{open_auction.summary_line()}. Ctrl+C to stop."
     )
     while True:
         now = dt.datetime.now(IST)
@@ -309,9 +385,28 @@ def loop(settings: dict) -> None:
                 log(f"Day-end email {'sent' if sent else 'failed'}: {detail}")
 
         status = market_status()
+        if open_auction.enabled() and now.weekday() < 5 and open_auction.in_prep_window():
+            kite, reason = _kite()
+            if kite is not None:
+                kite_ws.start()
+            plan = open_auction.ensure_plan(paper_trader.load_state(), kite)
+            log(
+                f"Pre-open: subscribed {len(plan)} auction contract(s)"
+                + ("" if kite else f" (no kite: {reason})")
+            )
+            time.sleep(5)
+            continue
+        if open_auction.enabled() and now.weekday() < 5 and open_auction.in_entry_window():
+            try:
+                run_open_auction(settings)
+            except Exception as exc:  # noqa: BLE001
+                log(f"Open auction failed, will retry: {exc}")
+            time.sleep(2)
+            continue
         if status != "open":
-            wait = seconds_until(dt.time(9, 15))
-            log(f"Market {status}. Sleeping {wait / 3600:.1f}h until the next session.")
+            wake = dt.time(9, 0) if open_auction.enabled() else dt.time(9, 15)
+            wait = seconds_until(wake)
+            log(f"Market {status}. Sleeping {wait / 3600:.1f}h until {wake:%H:%M}.")
             time.sleep(min(wait, 3600))
             continue
 
@@ -373,7 +468,13 @@ def main() -> int:
 
     settings = build_settings(args)
     if args.once:
-        cycle(settings)
+        now = dt.datetime.now(IST)
+        if open_auction.enabled() and now.weekday() < 5 and (
+            open_auction.in_prep_window() or open_auction.in_entry_window()
+        ):
+            run_open_auction(settings)
+        else:
+            cycle(settings)
         return 0
     try:
         loop(settings)

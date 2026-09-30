@@ -18,6 +18,56 @@ def _now_ist() -> str:
     return datetime.now(tz=IST).strftime("%H:%M:%S IST")
 
 
+def candidate_tokens_from_plan(plan_rows: list[dict[str, Any]] | None) -> list[int]:
+    tokens: list[int] = []
+    for row in plan_rows or []:
+        tok = int(row.get("instrument_token") or 0)
+        if tok > 0:
+            tokens.append(tok)
+    return tokens
+
+
+def candidate_ws_note(hits: int) -> str:
+    import kite_ws
+
+    if hits <= 0:
+        return "Waiting for WebSocket ticks on candidate options"
+    age = kite_ws.last_tick_age_seconds()
+    note = f"WebSocket LTP on {hits} candidate option(s)"
+    if age is not None:
+        note += f" · last tick {age:.1f}s ago"
+    return note
+
+
+def overlay_ws_on_plan_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str]:
+    """Refresh Will-buy-next premiums from WebSocket without a full scan."""
+    import kite_ws
+    import options
+
+    tokens = candidate_tokens_from_plan(rows)
+    if tokens:
+        kite_ws.start()
+        kite_ws.subscribe_tokens(tokens)
+    out: list[dict[str, Any]] = []
+    hits = 0
+    for row in rows:
+        updated = dict(row)
+        tok = int(updated.get("instrument_token") or 0)
+        last = kite_ws.ltp_for_token(tok) if tok else None
+        if last:
+            hits += 1
+            updated["Premium"] = round(last, 2)
+            lot_size = int(updated.get("Lot size") or 0)
+            lots = int(updated.get("Lots") or 0)
+            if lot_size and lots:
+                updated["Premium to pay"] = round(lots * last * lot_size, 2)
+            stop, target = options.premium_levels(last)
+            updated["Stop"] = stop
+            updated["Target"] = target
+        out.append(updated)
+    return out, candidate_ws_note(hits)
+
+
 def subscribe_open_instruments(state: dict[str, Any], extra_tokens: list[int] | None = None) -> None:
     import kite_ws
 

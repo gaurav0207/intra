@@ -12,6 +12,7 @@ import adaptive_policy
 import kite_client
 import live_kite
 import trading_policy
+import open_auction
 import options
 import paper_trader
 import pnl_realtime
@@ -196,16 +197,17 @@ try:
     import kite_ws
 
     if kite_ws.is_running():
-        st.sidebar.caption("Zerodha WebSocket LTP stream: connected")
+        st.sidebar.caption("Zerodha WebSocket: open legs + Will-buy-next + 9:15 auction")
     elif kite_ok:
         if kite_ws.start():
-            st.sidebar.caption("Zerodha WebSocket LTP stream: connected")
+            st.sidebar.caption("Zerodha WebSocket: open legs + Will-buy-next + 9:15 auction")
 except Exception:
     pass
 st.sidebar.caption(
     f"Entries {paper_trader.ENTRY_START:%H:%M}–{paper_trader.ENTRY_END:%H:%M} IST · "
     f"square-off {paper_trader.SQUARE_OFF:%H:%M} IST"
 )
+st.sidebar.caption(open_auction.summary_line())
 
 st.sidebar.markdown("---")
 st.sidebar.caption(
@@ -324,6 +326,8 @@ if kite_client_for_health:
     contracts = options.resolve_many(
         kite_client_for_health, {s: wanted[s] for s in ranked_wanted}
     )
+    options.subscribe_contract_tokens(contracts)
+    options.apply_live_premiums(contracts)
 option_marks: dict[str, float] = {}
 open_contracts = [
     pos["contract"]
@@ -361,9 +365,21 @@ if live_kite.is_enabled(paper_state) and kite_client_for_health:
     )
     prices = live_kite.apply_broker_marks_to_prices(paper_state, prices, zerodha_snap)
 st.session_state["_pnl_base_prices"] = dict(prices)
+auction_events: list[dict] = []
+if open_auction.enabled() and kite_client_for_health:
+    if open_auction.in_prep_window() or open_auction.in_entry_window():
+        if headless_executor:
+            open_auction.subscribe_plan(paper_state.get("open_auction_plan") or [])
+        else:
+            open_auction.ensure_plan(paper_state, kite_client_for_health)
+            paper_state = paper_trader.load_state()
+    if not headless_executor and open_auction.in_entry_window():
+        auction_events = open_auction.try_entries(paper_state, kite_client_for_health)
+        paper_state = paper_trader.load_state()
 adaptive_plan = adaptive_policy.decide(
     paper_state, tradable_signals, chart_data, prices, contracts=contracts
 )
+options.apply_live_premiums(adaptive_plan.candidate_contracts)
 if headless_executor:
     paper_events = []
     paper_state = paper_trader.load_state()
@@ -384,6 +400,7 @@ else:
         daily_profit_target=adaptive_plan.daily_profit_target,
         daily_loss_limit=adaptive_plan.daily_loss_limit,
     )
+paper_events = list(auction_events) + list(paper_events)
 
 st.subheader("Paper portfolio — simulated NFO options only")
 if not paper_state.get("auto_trading_enabled", True):
@@ -401,10 +418,12 @@ st.info(
     f"(sizing guide, no hard stop) · loss stop ₹{adaptive_plan.daily_loss_limit:,.0f}"
 )
 _now_ist = pd.Timestamp.now(tz="Asia/Kolkata").time()
-if status != "open":
-    st.caption(f"Market {status.replace('_', ' ')} — entries resume at {paper_trader.ENTRY_START:%H:%M} IST.")
+if open_auction.enabled() and open_auction.in_entry_window():
+    st.caption("Open auction window: buying from the option tape until 09:30 IST.")
+elif status != "open":
+    st.caption(f"Market {status.replace('_', ' ')} — open auction arms at 09:00, tape buys 09:15–09:30.")
 elif _now_ist < paper_trader.ENTRY_START:
-    st.caption(f"Waiting for the entry window to open at {paper_trader.ENTRY_START:%H:%M} IST.")
+    st.caption("Regular 5m entries start at 09:30 IST. Open auction (if armed) can buy from 09:15.")
 elif _now_ist >= paper_trader.ENTRY_END:
     st.caption(f"Entry window closed at {paper_trader.ENTRY_END:%H:%M} IST — exits only until square-off.")
 else:
@@ -507,50 +526,130 @@ session_halt = paper_trader.trading_halt_reason(
     adaptive_plan.daily_profit_target,
     adaptive_plan.daily_loss_limit,
 )
-plan_rows = paper_state.get("last_option_plan") or []
-if adaptive_plan.candidate_contracts:
-    plan_rows = paper_trader.option_plan_rows(
-        paper_state,
-        tradable_signals,
-        adaptive_plan.candidate_contracts,
-        adaptive_plan.candidate_budgets,
-        chart_data=chart_data,
-        minimum_confidence=adaptive_plan.confidence_required,
-        max_positions=adaptive_plan.max_positions,
-        in_window=status == "open",
-        kite_ok=kite_data_ok,
-        daily_profit_target=adaptive_plan.daily_profit_target,
-        daily_loss_limit=adaptive_plan.daily_loss_limit,
-        prices=prices,
+auction_plan = paper_state.get("open_auction_plan") or []
+if open_auction.enabled() and (auction_plan or open_auction.in_prep_window() or open_auction.in_entry_window()):
+    st.subheader("Open auction — 09:15 option tape")
+    st.caption(
+        "Pre-picked ATM from the daily bias. Buys only if the option or the underlying "
+        "has already gapped. This is not the 5-minute stock score."
     )
-st.subheader("Will buy next — NFO options only")
-if session_halt:
-    st.warning(f"No new option entries this session: {session_halt}.")
-if plan_rows:
-    show = pd.DataFrame(plan_rows)
-    drop = [c for c in show.columns if str(c).startswith("_")]
-    st.dataframe(show.drop(columns=drop, errors="ignore"), width="stretch", hide_index=True)
-    if paper_state.get("last_option_plan_at"):
-        st.caption(f"Last plan from the headless trader: {paper_state['last_option_plan_at']}")
-else:
-    watch_rows = paper_trader.option_watch_rows(
-        tradable_signals,
-        contracts,
-        adaptive_plan.confidence_required,
-        adaptive_plan.regime,
-    )
-    if watch_rows and not session_halt:
-        st.caption(
-            "No premium sized for a fill this refresh — closest entry-eligible setups:"
-        )
-        st.dataframe(pd.DataFrame(watch_rows), width="stretch", hide_index=True)
-    else:
-        st.caption("No ATM option is sized for a fill on this cycle.")
-        if not session_halt:
-            st.caption(
-                "The scan has no **ENTER/HOLD** short/long with room left toward target "
-                "(high-confidence **WAIT** rows in the table above are not buy signals yet)."
+    if auction_plan:
+        open_auction.subscribe_plan(auction_plan)
+        rows = []
+        taken = set(paper_state.get("open_auction_taken") or [])
+        for row in auction_plan:
+            fire, why, prem, spot = open_auction.evaluate_row(row, kite_client_for_health)
+            rows.append(
+                {
+                    "Contract": row.get("tradingsymbol"),
+                    "Bias": row.get("bias"),
+                    "Type": row.get("option_type"),
+                    "Prior premium": row.get("prev_premium") or None,
+                    "Tape ₹": round(prem, 2) if prem else None,
+                    "Spot": round(spot, 2) if spot else None,
+                    "Spot ref": row.get("spot_ref"),
+                    "Status": (
+                        "TAKEN"
+                        if row.get("underlying") in taken
+                        else ("READY TO BUY" if fire else "watching")
+                    ),
+                    "Why": why or "—",
+                }
             )
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    elif open_auction.in_prep_window():
+        st.caption("Arming overnight ATM list… headless trader builds this from 09:00 IST.")
+    else:
+        st.caption("No strong daily CE/PE was armed for this session.")
+
+st.session_state["_will_buy"] = {
+    "contracts": contracts,
+    "candidate_contracts": adaptive_plan.candidate_contracts,
+    "candidate_budgets": adaptive_plan.candidate_budgets,
+    "confidence": adaptive_plan.confidence_required,
+    "max_positions": adaptive_plan.max_positions,
+    "in_window": status == "open",
+    "kite_ok": kite_data_ok,
+    "daily_profit_target": adaptive_plan.daily_profit_target,
+    "daily_loss_limit": adaptive_plan.daily_loss_limit,
+    "regime": adaptive_plan.regime,
+    "session_halt": session_halt,
+    "last_plan_at": paper_state.get("last_option_plan_at"),
+}
+
+
+@st.fragment(run_every=timedelta(seconds=pnl_realtime.PNL_REFRESH_SECONDS))
+def render_will_buy_next() -> None:
+    state = paper_trader.load_state()
+    ctx = st.session_state.get("_will_buy") or {}
+    search = dict(ctx.get("contracts") or {})
+    chosen = dict(ctx.get("candidate_contracts") or {})
+    options.subscribe_contract_tokens(search)
+    options.subscribe_contract_tokens(chosen)
+    extra = pnl_realtime.candidate_tokens_from_plan(state.get("last_option_plan") or [])
+    pnl_realtime.subscribe_open_instruments(state, extra_tokens=extra)
+    options.apply_live_premiums(search)
+    hits = options.apply_live_premiums(chosen)
+
+    plan_rows = state.get("last_option_plan") or []
+    ws_note = ""
+    if chosen:
+        plan_rows = paper_trader.option_plan_rows(
+            state,
+            tradable_signals,
+            chosen,
+            ctx.get("candidate_budgets") or {},
+            chart_data=chart_data,
+            minimum_confidence=int(ctx.get("confidence") or 0),
+            max_positions=int(ctx.get("max_positions") or 5),
+            in_window=bool(ctx.get("in_window")),
+            kite_ok=bool(ctx.get("kite_ok")),
+            daily_profit_target=ctx.get("daily_profit_target"),
+            daily_loss_limit=ctx.get("daily_loss_limit"),
+            prices=st.session_state.get("_pnl_base_prices") or {},
+        )
+        ws_note = pnl_realtime.candidate_ws_note(hits)
+    elif plan_rows:
+        plan_rows, ws_note = pnl_realtime.overlay_ws_on_plan_rows(plan_rows)
+
+    st.subheader("Will buy next — NFO options only")
+    halt = ctx.get("session_halt")
+    if halt:
+        st.warning(f"No new option entries this session: {halt}.")
+    if ws_note:
+        st.caption(ws_note)
+    if plan_rows:
+        show = pd.DataFrame(plan_rows)
+        drop = [
+            c
+            for c in show.columns
+            if str(c).startswith("_") or c == "instrument_token"
+        ]
+        st.dataframe(show.drop(columns=drop, errors="ignore"), width="stretch", hide_index=True)
+        if ctx.get("last_plan_at"):
+            st.caption(f"Last plan from the headless trader: {ctx['last_plan_at']}")
+    else:
+        watch_rows = paper_trader.option_watch_rows(
+            tradable_signals,
+            search,
+            int(ctx.get("confidence") or 0),
+            str(ctx.get("regime") or ""),
+        )
+        if watch_rows and not halt:
+            st.caption(
+                "No premium sized for a fill this refresh — closest entry-eligible setups:"
+            )
+            st.dataframe(pd.DataFrame(watch_rows), width="stretch", hide_index=True)
+        else:
+            st.caption("No ATM option is sized for a fill on this cycle.")
+            if not halt:
+                st.caption(
+                    "The scan has no **ENTER/HOLD** short/long with room left toward target "
+                    "(high-confidence **WAIT** rows in the table above are not buy signals yet)."
+                )
+
+
+render_will_buy_next()
 
 paper_trader.sync_with_broker(paper_state)
 paper_state = paper_trader.load_state()

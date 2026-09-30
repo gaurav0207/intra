@@ -64,6 +64,10 @@ def new_state(initial_cash: float) -> dict[str, Any]:
         "live_trading_enabled": False,
         "loss_halt_date": "",
         "loss_halt_reason": "",
+        "open_auction_plan": [],
+        "open_auction_spots": [],
+        "open_auction_date": "",
+        "open_auction_taken": [],
         "updated_at": _now(),
     }
 
@@ -97,6 +101,10 @@ def load_state(initial_cash: float | None = None) -> dict[str, Any]:
         state.setdefault("live_trading_enabled", False)
         state.setdefault("loss_halt_date", "")
         state.setdefault("loss_halt_reason", "")
+        state.setdefault("open_auction_plan", [])
+        state.setdefault("open_auction_spots", [])
+        state.setdefault("open_auction_date", "")
+        state.setdefault("open_auction_taken", [])
         state.setdefault("initial_cash", float(initial_cash))
         state.setdefault("cash", float(initial_cash))
         state["_loaded_at"] = _now()
@@ -131,6 +139,10 @@ def save_state(state: dict[str, Any]) -> None:
                     "live_trading_enabled",
                     "loss_halt_date",
                     "loss_halt_reason",
+                    "open_auction_plan",
+                    "open_auction_spots",
+                    "open_auction_date",
+                    "open_auction_taken",
                 ):
                     if key in disk:
                         state[key] = disk[key]
@@ -515,6 +527,7 @@ def option_plan_rows(
             "Conf %": sig.confidence,
             "Score": sig.score,
             "Status": status,
+            "instrument_token": int(contract.instrument_token),
         }
         if chart_data and symbol in chart_data:
             row["_key"] = (
@@ -747,9 +760,11 @@ def open_position(
     spot_at_entry: float | None = None,
     underlying_stop: float | None = None,
     underlying_target: float | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     if contract is None:
         return None
+    options.apply_live_premium(contract)
     side = str(contract.option_type).upper()
     price = round(float(contract.premium), 2)
     stop = float(contract.stop)
@@ -782,6 +797,8 @@ def open_position(
         "instrument_token": int(contract.instrument_token),
         "underlying_side": "LONG" if side == "CE" else "SHORT",
     }
+    if extra:
+        position.update(extra)
     if spot_at_entry is not None:
         position["underlying_spot_entry"] = round(float(spot_at_entry), 2)
     if underlying_stop is not None:
@@ -826,15 +843,23 @@ def open_position(
         if live_kite.is_enabled(state)
         else "Paper only — entry passed Zerodha MIS/OI and premium-cap checks."
     )
+    auction = str(position.get("entry_style") or "") == "open_auction"
+    headline = (
+        "OPEN-AUCTION PAPER OPTION BUY — 9:15 option tape, not a 5m stock signal."
+        if auction
+        else "INSTANT PAPER OPTION BUY — debit only, no cash shares."
+    )
+    why = str(position.get("open_auction_reason") or "")
     body = (
-        f"INSTANT PAPER OPTION BUY — debit only, no cash shares.\n\n"
+        f"{headline}\n\n"
         f"Underlying: {symbol}\n"
         f"Contract: {contract.tradingsymbol}\n"
         f"Type: {side}  Strike: {contract.strike:g}  Expiry: {contract.expiry}\n"
         f"Premium: ₹{price:,.2f}\nLots: {lots} × {contract.lot_size} = {quantity} qty\n"
         f"Premium paid: ₹{amount:,.2f}\nStop: ₹{position['stop']:,.2f}\n"
-        f"Target: ₹{position['target']:,.2f}\nConfidence: {confidence}%\n"
-        f"Cash remaining: ₹{round(float(state['cash']) - amount, 2):,.2f}\n"
+        f"Target: ₹{position['target']:,.2f}\n"
+        + (f"Tape: {why}\n" if why else f"Confidence: {confidence}%\n")
+        + f"Cash remaining: ₹{round(float(state['cash']) - amount, 2):,.2f}\n"
         f"{broker_line}{live_note}"
     )
 
@@ -847,8 +872,12 @@ def open_position(
         event["live_kite"] = live_result
     _record_event(state, event)
     subject = f"[Trader] BUY {side}: {contract.tradingsymbol} × {lots} @ ₹{price:,.2f}"
+    if auction:
+        subject = f"[Trader] OPEN {side}: {contract.tradingsymbol} × {lots} @ ₹{price:,.2f}"
     if live_result:
         subject = f"[Trader] LIVE+BUY {side}: {contract.tradingsymbol} × {lots}"
+        if auction:
+            subject = f"[Trader] LIVE+OPEN {side}: {contract.tradingsymbol} × {lots}"
     ok, detail = send_email(subject, body)
     event["email"] = {"sent": ok, "detail": detail}
     save_state(state)
@@ -1364,13 +1393,13 @@ def run_cycle(
 
     # Exits run even if auto-entry has been switched off.
     for symbol in list(state["open_positions"]):
-        if symbol not in signals:
-            continue
         position = state["open_positions"][symbol]
+        option = is_option_position(position)
+        if symbol not in signals and not option:
+            continue
         if position.get("exit_pending") or position.get("order_status") == "Open":
             continue
-        sig = signals[symbol]
-        option = is_option_position(position)
+        sig = signals.get(symbol)
         bar = chart_data[symbol].iloc[-1] if symbol in chart_data else None
         reason = None
         if option:
@@ -1400,11 +1429,11 @@ def run_cycle(
             elif prem_stop:
                 pct = (mark / entry_px - 1) * 100 if entry_px else 0
                 reason = f"Premium stop hit ({pct:.1f}% premium)"
-            if reason is None and _score_reverses_option(
+            if reason is None and sig is not None and _score_reverses_option(
                 _underlying_side_for_option(position), int(sig.score)
             ):
                 reason = f"Signal reversal (score {sig.score})"
-            elif reason is None and sig.what_to_do == "EXIT NOW":
+            elif reason is None and sig is not None and sig.what_to_do == "EXIT NOW":
                 closed = getattr(sig, "closed_side", None)
                 if str(closed or "").upper() == _underlying_side_for_option(position):
                     reason = sig.exit_reason or "Underlying setup exited"
