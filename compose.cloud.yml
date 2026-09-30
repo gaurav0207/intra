@@ -5,6 +5,8 @@ services:
     env_file: .env
     environment:
       PAPER_EXECUTOR: headless
+      PAPER_INITIAL_CASH: "100000"
+      TRADER_DAILY_LOSS_LIMIT: "5000"
     expose:
       - "8501"
     volumes:
@@ -14,6 +16,9 @@ services:
     build: .
     restart: unless-stopped
     env_file: .env
+    environment:
+      PAPER_INITIAL_CASH: "100000"
+      TRADER_DAILY_LOSS_LIMIT: "5000"
     command: ["python", "auto_trader.py", "--loop"]
     volumes:
       - state:/data

@@ -17,10 +17,17 @@ from typing import Any
 import pandas as pd
 
 import live_kite
+import trading_policy
+import options
 from signals import entry_side
 
 STATE_PATH = Path(os.getenv("PAPER_TRADING_FILE", "paper_trades.json"))
 IST = "Asia/Kolkata"
+DEFAULT_INITIAL_CASH = float(os.getenv("PAPER_INITIAL_CASH", "50000"))
+
+
+def default_initial_cash() -> float:
+    return DEFAULT_INITIAL_CASH
 
 # Entries are allowed only inside this window; exits run any time the market is
 # open. Candle timestamps can lag wall clock by ~15 minutes on delayed feeds, so
@@ -55,11 +62,15 @@ def new_state(initial_cash: float) -> dict[str, Any]:
         "day_end_email_date": "",
         "auto_trading_enabled": True,
         "live_trading_enabled": False,
+        "loss_halt_date": "",
+        "loss_halt_reason": "",
         "updated_at": _now(),
     }
 
 
-def load_state(initial_cash: float = 100_000) -> dict[str, Any]:
+def load_state(initial_cash: float | None = None) -> dict[str, Any]:
+    if initial_cash is None:
+        initial_cash = default_initial_cash()
     if not STATE_PATH.exists():
         state = new_state(initial_cash)
         save_state(state)
@@ -84,8 +95,11 @@ def load_state(initial_cash: float = 100_000) -> dict[str, Any]:
         state.setdefault("day_end_email_date", "")
         state.setdefault("auto_trading_enabled", True)
         state.setdefault("live_trading_enabled", False)
+        state.setdefault("loss_halt_date", "")
+        state.setdefault("loss_halt_reason", "")
         state.setdefault("initial_cash", float(initial_cash))
         state.setdefault("cash", float(initial_cash))
+        state["_loaded_at"] = _now()
         return state
     except (OSError, ValueError, json.JSONDecodeError):
         backup = STATE_PATH.with_suffix(f".broken-{datetime.now():%Y%m%d-%H%M%S}.json")
@@ -99,6 +113,30 @@ def load_state(initial_cash: float = 100_000) -> dict[str, Any]:
 
 
 def save_state(state: dict[str, Any]) -> None:
+    if STATE_PATH.exists():
+        try:
+            disk = json.loads(STATE_PATH.read_text())
+            disk_at = str(disk.get("updated_at") or "")
+            loaded_at = str(state.get("_loaded_at") or "")
+            if disk_at and loaded_at and disk_at > loaded_at:
+                for key in (
+                    "cash",
+                    "initial_cash",
+                    "open_positions",
+                    "trades",
+                    "events",
+                    "seen_entries",
+                    "seen_intents",
+                    "auto_trading_enabled",
+                    "live_trading_enabled",
+                    "loss_halt_date",
+                    "loss_halt_reason",
+                ):
+                    if key in disk:
+                        state[key] = disk[key]
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+    state.pop("_loaded_at", None)
     state["updated_at"] = _now()
     temp = STATE_PATH.with_suffix(".tmp")
     temp.write_text(json.dumps(state, indent=2, ensure_ascii=False))
@@ -106,7 +144,38 @@ def save_state(state: dict[str, Any]) -> None:
 
 
 def reset_state(initial_cash: float) -> dict[str, Any]:
+    """Fresh paper book; keeps dashboard trading toggles; clears trade/event logs."""
+    preserved: dict[str, Any] = {}
+    if STATE_PATH.exists():
+        try:
+            old = json.loads(STATE_PATH.read_text())
+            if isinstance(old, dict):
+                for key in ("auto_trading_enabled", "live_trading_enabled"):
+                    if key in old:
+                        preserved[key] = old[key]
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
     state = new_state(initial_cash)
+    state.update(preserved)
+    state["trades"] = []
+    state["events"] = []
+    state["seen_entries"] = []
+    state["seen_intents"] = []
+    state["open_positions"] = {}
+    save_state(state)
+    return state
+
+
+def rebase_capital(target: float) -> dict[str, Any]:
+    """Set cash and initial_cash to *target* when flat; otherwise only fix initial baseline."""
+    target = round(float(target), 2)
+    state = load_state()
+    if state.get("open_positions"):
+        state["initial_cash"] = target
+        save_state(state)
+        return state
+    state["cash"] = target
+    state["initial_cash"] = target
     save_state(state)
     return state
 
@@ -396,8 +465,8 @@ def option_plan_rows(
     """Rows the dashboard and the will-invest email both use."""
     rows: list[dict[str, Any]] = []
     prices = prices or {}
-    session_halt = trading_halt_reason(
-        state, prices, daily_profit_target, daily_loss_limit
+    session_halt = session_entry_block_reason(
+        state, prices, daily_profit_target, daily_loss_limit, chart_data
     )
     for symbol, contract in contracts.items():
         sig = signals.get(symbol)
@@ -423,6 +492,11 @@ def option_plan_rows(
             blockers.append(f"waiting for the {ENTRY_START:%H:%M}–{ENTRY_END:%H:%M} IST window")
         if not kite_ok:
             blockers.append("waiting for live Kite data")
+        if not contract.mis_eligible():
+            blockers.append(
+                f"Zerodha would reject MIS (OI {contract.oi_lots:.0f} lots "
+                f"< {options.MIN_MIS_OI_LOTS}) — no paper/live entry"
+            )
         if lots < 1:
             blockers.append("premium × lot is above the reserved slot")
         if len(state["open_positions"]) >= int(max_positions):
@@ -449,6 +523,45 @@ def option_plan_rows(
             )
         rows.append(row)
     rows.sort(key=lambda r: -int(r["Conf %"]))
+    return rows
+
+
+def option_watch_rows(
+    signals: dict[str, Any],
+    contracts: dict[str, Any],
+    minimum_confidence: int,
+    regime: str,
+) -> list[dict[str, Any]]:
+    """When nothing is sized yet, show eligible underlyings and why they are not filling."""
+    rows: list[dict[str, Any]] = []
+    for symbol, sig in sorted(signals.items(), key=lambda item: -item[1].confidence):
+        side = entry_side(sig)
+        if side is None:
+            continue
+        contract = contracts.get(symbol)
+        blockers: list[str] = []
+        if sig.confidence < minimum_confidence:
+            blockers.append(f"confidence {sig.confidence}% < {minimum_confidence}% ({regime})")
+        if contract is None:
+            blockers.append(
+                f"no ATM {('PE' if side == 'SHORT' else 'CE')} "
+                f"(DTE window or OI < {options.MIN_MIS_OI_LOTS} lots for MIS)"
+            )
+        elif contract.mis_eligible():
+            blockers.append("waiting for adaptive sizing / next trader cycle")
+        rows.append(
+            {
+                "Underlying": symbol,
+                "Signal": sig.what_to_do,
+                "Side": side,
+                "Conf %": sig.confidence,
+                "Contract": contract.tradingsymbol if contract else "—",
+                "OI (lots)": contract.oi_lots if contract else "—",
+                "Why not filling": "; ".join(blockers) if blockers else "eligible — check cash/slots",
+            }
+        )
+        if len(rows) >= 10:
+            break
     return rows
 
 
@@ -631,6 +744,9 @@ def open_position(
     score: int,
     signal_key: str,
     contract: Any | None = None,
+    spot_at_entry: float | None = None,
+    underlying_stop: float | None = None,
+    underlying_target: float | None = None,
 ) -> dict[str, Any] | None:
     if contract is None:
         return None
@@ -641,6 +757,7 @@ def open_position(
     available = min(float(budget), float(state["cash"]))
     lot_cost = contract.cost_per_lot()
     lots = math.floor(available / lot_cost) if lot_cost > 0 else 0
+    lots = trading_policy.cap_lots(lots)
     quantity = lots * int(contract.lot_size)
     if lots < 1 or symbol in state["open_positions"]:
         return None
@@ -663,7 +780,19 @@ def open_position(
         "strike": float(contract.strike),
         "expiry": contract.expiry,
         "instrument_token": int(contract.instrument_token),
+        "underlying_side": "LONG" if side == "CE" else "SHORT",
     }
+    if spot_at_entry is not None:
+        position["underlying_spot_entry"] = round(float(spot_at_entry), 2)
+    if underlying_stop is not None:
+        position["underlying_stop"] = round(float(underlying_stop), 2)
+    if underlying_target is not None:
+        position["underlying_target"] = round(float(underlying_target), 2)
+
+    broker_ok, broker_note = live_kite.validate_entry(state, position)
+    if not broker_ok:
+        return None
+
     live_note = ""
     live_result: dict[str, Any] | None = None
     if live_kite.is_enabled(state):
@@ -677,13 +806,16 @@ def open_position(
             )
             return None
         position["live_kite_entry"] = live_result
-        cap_note = live_result.get("cap_note") or ""
+        position["order_status"] = "Open"
+        cap_note = live_result.get("cap_note") or broker_note or ""
         live_note = (
             f"\n\nLIVE ZERODHA ORDER PLACED\n"
             f"Order ID: {live_result.get('order_id')}\n"
             f"Limit: ₹{live_result.get('limit_price'):,.2f} · qty {live_result.get('quantity')}\n"
             + (f"{cap_note}\n" if cap_note else "")
         )
+    else:
+        position["order_status"] = "Executed"
 
     lots = int(position["lots"])
     quantity = int(position["quantity"])
@@ -692,7 +824,7 @@ def open_position(
     broker_line = (
         "Mirrored to your Zerodha account (see LIVE section below)."
         if live_kite.is_enabled(state)
-        else "No real broker order is placed."
+        else "Paper only — entry passed Zerodha MIS/OI and premium-cap checks."
     )
     body = (
         f"INSTANT PAPER OPTION BUY — debit only, no cash shares.\n\n"
@@ -743,17 +875,210 @@ def manual_exit_positions(
     return events
 
 
+def _apply_entry_fill(state: dict[str, Any], position: dict[str, Any], order: dict[str, Any]) -> None:
+    """Replace the assumed limit with Zerodha's average fill, once."""
+    if position.get("fill_applied"):
+        return
+    avg = float(order.get("average_price") or 0)
+    filled = int(order.get("filled_quantity") or 0)
+    if avg <= 0 or filled <= 0:
+        return
+    old_amount = float(position.get("amount_invested") or 0)
+    new_amount = round(avg * filled, 2)
+    state["cash"] = round(float(state["cash"]) + old_amount - new_amount, 2)
+    position["entry_price"] = round(avg, 2)
+    position["quantity"] = filled
+    lot = int(position.get("lot_size") or 0)
+    if lot > 0:
+        position["lots"] = max(1, filled // lot)
+    position["amount_invested"] = new_amount
+    position["fill_applied"] = True
+
+
+def sync_with_broker(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """Make the paper book follow Zerodha order status when live mirroring is on.
+
+    Unfilled entry orders stay Open and are not treated as a position.
+    A cancelled or rejected entry is removed and its reserved cash is returned.
+    An exit stays on the book until Kite reports the sell as Executed, then the
+    paper trade is Closed at the average fill.
+    """
+    events: list[dict[str, Any]] = []
+    if not live_kite.is_enabled(state):
+        for position in state.get("open_positions", {}).values():
+            position.setdefault("order_status", "Open")
+        return events
+
+    book = live_kite.fetch_broker_book()
+    if book is None:
+        return events
+    orders, net_qty = book
+
+    def _drop_unfilled(symbol: str, position: dict[str, Any], reason: str) -> None:
+        state["cash"] = round(float(state["cash"]) + float(position.get("amount_invested") or 0), 2)
+        state["open_positions"].pop(symbol, None)
+        events.append(
+            {
+                "time": _now(),
+                "type": "ORDER_CLOSED",
+                "symbol": symbol,
+                "contract": position.get("contract"),
+                "order_status": "Closed",
+                "reason": reason,
+            }
+        )
+
+    for symbol in list(state.get("open_positions", {})):
+        position = state["open_positions"][symbol]
+        contract = str(position.get("contract") or "")
+        entry = position.get("live_kite_entry") or {}
+        order_id = str(entry.get("order_id") or "")
+        order = orders.get(order_id) if order_id else None
+        phase = live_kite.order_phase(order) if order else None
+        broker_qty = int(net_qty.get(contract, 0)) if contract else 0
+        if phase == "Closed":
+            _drop_unfilled(
+                symbol,
+                position,
+                f"Zerodha {order.get('status') if order else 'cancelled'} — entry not filled",
+            )
+            continue
+        if phase == "Open":
+            position["order_status"] = "Open"
+            continue
+        if phase == "Executed" and broker_qty > 0:
+            _apply_entry_fill(state, position, order or {})
+            position["order_status"] = "Executed"
+        elif broker_qty > 0 and phase is None:
+            position["order_status"] = "Executed"
+        elif not position.get("fill_applied"):
+            # Not an open order and not a long position on Zerodha.
+            # Yesterday's cancelled order is absent from today's order book.
+            _drop_unfilled(
+                symbol,
+                position,
+                "Not open on Zerodha (cancelled or never filled)",
+            )
+            continue
+        else:
+            exit_meta = position.get("live_kite_exit") or {}
+            exit_order = orders.get(str(exit_meta.get("order_id") or ""))
+            avg = 0.0
+            if exit_order and live_kite.order_phase(exit_order) == "Executed":
+                avg = float(exit_order.get("average_price") or 0)
+            if avg <= 0 and contract:
+                avg = live_kite.completed_sell_average(orders, contract)
+            if avg <= 0 and exit_order and live_kite.order_phase(exit_order) == "Open":
+                position["exit_pending"] = True
+                position["order_status"] = "Open"
+                continue
+            position["order_status"] = "Closed"
+            event = close_position(
+                state,
+                symbol,
+                avg if avg > 0 else float(position.get("entry_price") or 0),
+                str(position.get("pending_exit_reason") or "Zerodha exit filled"),
+                skip_broker=True,
+                save=False,
+            )
+            if event:
+                events.append(event)
+            continue
+
+        exit_meta = position.get("live_kite_exit") or {}
+        exit_id = str(exit_meta.get("order_id") or "")
+        if not exit_id:
+            continue
+        exit_order = orders.get(exit_id)
+        exit_phase = live_kite.order_phase(exit_order)
+        if exit_phase == "Executed" and exit_order:
+            avg = float(exit_order.get("average_price") or exit_meta.get("limit_price") or 0)
+            reason = str(position.get("pending_exit_reason") or "Zerodha exit executed")
+            position["exit_pending"] = False
+            event = close_position(
+                state,
+                symbol,
+                avg or float(position["entry_price"]),
+                reason,
+                skip_broker=True,
+                save=False,
+            )
+            if event:
+                events.append(event)
+        elif exit_phase == "Closed":
+            position["exit_pending"] = False
+            position.pop("live_kite_exit", None)
+            position.pop("pending_exit_reason", None)
+            if position.get("fill_applied"):
+                position["order_status"] = "Executed"
+        else:
+            position["exit_pending"] = True
+            position["order_status"] = "Open"
+
+    if events or state.get("open_positions"):
+        save_state(state)
+    return events
+
+
 def close_position(
     state: dict[str, Any],
     symbol: str,
     price: float,
     reason: str,
+    *,
+    skip_broker: bool = False,
+    save: bool = True,
 ) -> dict[str, Any] | None:
-    position = state["open_positions"].pop(symbol, None)
+    position = state["open_positions"].get(symbol)
     if not position:
         return None
 
     price = round(float(price), 2)
+    live_result: dict[str, Any] | None = None
+    if live_kite.is_enabled(state) and position.get("contract") and not skip_broker:
+        if position.get("order_status") == "Open" and not position.get("exit_pending"):
+            return None
+        live_result = live_kite.mirror_exit(position, price)
+        if live_result.get("ok"):
+            position["live_kite_exit"] = live_result
+            orders = live_kite.fetch_orders_by_id()
+            exit_order = orders.get(str(live_result.get("order_id")))
+            if live_kite.order_phase(exit_order) != "Executed":
+                position["exit_pending"] = True
+                position["pending_exit_reason"] = reason
+                position["order_status"] = "Open"
+                save_state(state)
+                return {
+                    "time": _now(),
+                    "type": "EXIT_WORKING",
+                    "symbol": symbol,
+                    "contract": position.get("contract"),
+                    "order_status": "Open",
+                    "order_id": live_result.get("order_id"),
+                    "limit_price": live_result.get("limit_price"),
+                }
+            if exit_order and float(exit_order.get("average_price") or 0) > 0:
+                price = round(float(exit_order["average_price"]), 2)
+        if live_result.get("ok") and live_result.get("limit_price") and price <= 0:
+            price = round(float(live_result["limit_price"]), 2)
+        if not live_result.get("ok"):
+            send_email(
+                "[Trader] LIVE EXIT FAILED — paper position kept open",
+                f"Contract: {position.get('contract') or symbol}\n"
+                f"Error: {live_result.get('error')}\n\n"
+                "Paper was NOT closed so the books stay aligned with Zerodha.",
+            )
+            return {
+                "time": _now(),
+                "type": "EXIT_FAILED",
+                "symbol": symbol,
+                "contract": position.get("contract"),
+                "error": live_result.get("error"),
+            }
+
+    position = state["open_positions"].pop(symbol, None)
+    if not position:
+        return None
     quantity = int(position["quantity"])
     side = str(position.get("side", "LONG")).upper()
     invested = float(position["amount_invested"])
@@ -776,33 +1101,23 @@ def close_position(
         "pnl_pct": pnl_pct,
         "exit_reason": reason,
         "status": "CLOSED",
+        "order_status": "Closed",
     }
     state["trades"].append(trade)
     event_type = "SELL" if side == "LONG" else "COVER"
     event = {"time": _now(), "type": event_type, **trade, "cash_after": state["cash"]}
     _record_event(state, event)
 
-    live_result: dict[str, Any] | None = None
     live_note = ""
-    if live_kite.is_enabled(state) and position.get("contract"):
-        live_result = live_kite.mirror_exit(position, price)
-        if live_result.get("ok"):
-            trade["live_kite_exit"] = live_result
-            live_note = (
-                f"\n\nLIVE ZERODHA EXIT ORDER\n"
-                f"Order ID: {live_result.get('order_id')}\n"
-                f"Limit: ₹{live_result.get('limit_price'):,.2f}\n"
-            )
-        else:
-            live_note = (
-                f"\n\nLIVE ZERODHA EXIT FAILED — check Kite positions manually!\n"
-                f"Error: {live_result.get('error')}\n"
-            )
-            send_email(
-                "[Trader] LIVE EXIT FAILED — manual action needed",
-                f"Paper exit completed for {position.get('contract') or symbol} but "
-                f"Zerodha SELL failed:\n{live_result.get('error')}",
-            )
+    if live_result and live_result.get("ok"):
+        trade["live_kite_exit"] = live_result
+        live_note = (
+            f"\n\nLIVE ZERODHA EXIT ORDER (LIMIT — not market)\n"
+            f"Order ID: {live_result.get('order_id')}\n"
+            f"Limit: ₹{live_result.get('limit_price'):,.2f}\n"
+            f"Qty: {live_result.get('quantity')} · {live_result.get('product', 'MIS')}\n"
+            f"{live_result.get('pricing_note', '')}\n"
+        )
 
     result = "profit" if pnl >= 0 else "loss"
     broker_line = (
@@ -826,7 +1141,8 @@ def close_position(
     event["email"] = {"sent": ok, "detail": detail}
     if live_result:
         event["live_kite"] = live_result
-    save_state(state)
+    if save:
+        save_state(state)
     return event
 
 
@@ -858,6 +1174,22 @@ def portfolio_summary(state: dict[str, Any], prices: dict[str, float]) -> dict[s
     }
 
 
+def _today_key() -> str:
+    return pd.Timestamp.now(tz=IST).strftime("%Y-%m-%d")
+
+
+def arm_loss_halt(state: dict[str, Any], reason: str) -> None:
+    """Latch: no new entries for the rest of this IST calendar day."""
+    state["loss_halt_date"] = _today_key()
+    state["loss_halt_reason"] = reason
+
+
+def loss_halt_active(state: dict[str, Any]) -> str | None:
+    if state.get("loss_halt_date") == _today_key():
+        return str(state.get("loss_halt_reason") or "daily loss stop already hit today")
+    return None
+
+
 def trading_halt_reason(
     state: dict[str, Any],
     prices: dict[str, float],
@@ -868,12 +1200,34 @@ def trading_halt_reason(
 
     The daily profit figure is a sizing objective only — hitting it does not halt trading.
     """
+    latched = loss_halt_active(state)
+    if latched:
+        return latched
     session_pnl = today_pnl(state, prices)
     if daily_loss_limit is not None and session_pnl <= -float(daily_loss_limit):
         return (
             f"daily loss limit reached (today ₹{session_pnl:+,.0f}; "
             f"limit ₹{-float(daily_loss_limit):,.0f})"
         )
+    return None
+
+
+def session_entry_block_reason(
+    state: dict[str, Any],
+    prices: dict[str, float],
+    daily_profit_target: float | None,
+    daily_loss_limit: float | None,
+    chart_data: dict[str, pd.DataFrame] | None = None,
+) -> str | None:
+    halt = trading_halt_reason(state, prices, daily_profit_target, daily_loss_limit)
+    if halt and "daily loss limit reached" in halt:
+        arm_loss_halt(state, halt)
+    if halt:
+        return halt
+    if chart_data:
+        pe_block = trading_policy.block_new_pe_reason(chart_data)
+        if pe_block:
+            return pe_block
     return None
 
 
@@ -898,6 +1252,42 @@ def today_pnl(state: dict[str, Any], prices: dict[str, float]) -> float:
     return round(realized + unrealized, 2)
 
 
+def _underlying_side_for_option(position: dict[str, Any]) -> str:
+    stored = position.get("underlying_side")
+    if stored:
+        return str(stored).upper()
+    side = str(position.get("side", "")).upper()
+    return "LONG" if side == "CE" else "SHORT"
+
+
+def _score_reverses_option(underlying_side: str, score: int) -> bool:
+    threshold = trading_policy.option_reversal_score()
+    if underlying_side == "LONG":
+        return score <= -threshold
+    return score >= threshold
+
+
+def _bar_hits_underlying_levels(
+    bar: pd.Series, underlying_side: str, stop: float, target: float
+) -> tuple[bool, bool]:
+    high = float(bar["high"])
+    low = float(bar["low"])
+    if underlying_side == "LONG":
+        return low <= stop, high >= target
+    return high >= stop, low <= target
+
+
+def _trail_underlying_levels_from_signal(position: dict[str, Any], sig: Any) -> None:
+    """Keep option exits aligned with the simulator's trailed spot stop/target."""
+    u_side = _underlying_side_for_option(position)
+    if not sig.in_trade or str(sig.side).upper() != u_side:
+        return
+    if sig.stop_loss is not None:
+        position["underlying_stop"] = round(float(sig.stop_loss), 2)
+    if sig.target is not None:
+        position["underlying_target"] = round(float(sig.target), 2)
+
+
 def _already_exited_this_move(state: dict[str, Any], symbol: str, sig: Any) -> bool:
     """True when we already closed this symbol today and the signal is still
     holding the same move, so re-entering would just repeat the trade we left."""
@@ -916,6 +1306,21 @@ def _already_exited_this_move(state: dict[str, Any], symbol: str, sig: Any) -> b
         if stamp.strftime("%Y-%m-%d") != today:
             continue
         return entered_at <= stamp.strftime("%H:%M")
+    return False
+
+
+def _loss_reentry_blocked(state: dict[str, Any], symbol: str) -> bool:
+    """Skip re-entry after today's losing option exit on this underlying."""
+    today = pd.Timestamp.now(tz=IST).strftime("%Y-%m-%d")
+    for trade in reversed(state.get("trades", [])):
+        if trade.get("symbol") != symbol or not trade.get("exit_time"):
+            continue
+        if not trade.get("contract"):
+            continue
+        stamp = pd.Timestamp(trade["exit_time"]).tz_convert(IST)
+        if stamp.strftime("%Y-%m-%d") != today:
+            continue
+        return float(trade.get("pnl", 0)) < 0
     return False
 
 
@@ -939,6 +1344,7 @@ def run_cycle(
 ) -> list[dict[str, Any]]:
     """Exit existing positions, then enter the strongest eligible fresh signal."""
     events: list[dict[str, Any]] = []
+    events.extend(sync_with_broker(state))
     now = pd.Timestamp.now(tz=IST).time()
     candidate_contracts = candidate_contracts or {}
     option_marks = option_marks or {}
@@ -961,17 +1367,52 @@ def run_cycle(
         if symbol not in signals:
             continue
         position = state["open_positions"][symbol]
+        if position.get("exit_pending") or position.get("order_status") == "Open":
+            continue
         sig = signals[symbol]
         option = is_option_position(position)
+        bar = chart_data[symbol].iloc[-1] if symbol in chart_data else None
+        reason = None
         if option:
             mark = float(option_marks.get(symbol, position["entry_price"]))
             fill = mark
-            stop_hit = mark <= float(position["stop"])
-            target_hit = mark >= float(position["target"])
+            entry_px = float(position["entry_price"])
+            take_profit_px = round(entry_px * (1 + trading_policy.option_take_profit_fraction()), 2)
+            # The contract target can be +50%. Exit at the smaller gain instead of waiting for a stop.
+            if take_profit_px < float(position.get("target") or take_profit_px):
+                position["target"] = take_profit_px
+            arm_px = round(entry_px * (1 + trading_policy.option_breakeven_arm_fraction()), 2)
+            loss_stop = round(entry_px * (1 - trading_policy.option_stop_fraction()), 2)
+            # Tighten a 35% contract stop down to the premium stop. Never loosen it.
+            if entry_px > 0 and float(position["stop"]) < loss_stop:
+                position["stop"] = loss_stop
+            if entry_px > 0 and mark >= arm_px:
+                locked = round(entry_px, 2)
+                if float(position["stop"]) < locked:
+                    position["stop"] = locked
+            prem_stop = mark <= float(position["stop"])
+            prem_target = mark >= float(position["target"])
+            if prem_target and mark >= entry_px:
+                pct = (mark / entry_px - 1) * 100 if entry_px else 0
+                reason = f"Small profit taken (+{pct:.1f}% premium)"
+            elif prem_stop and abs(mark - entry_px) <= max(0.05, entry_px * 0.01):
+                reason = "Breakeven stop (gave back a small profit)"
+            elif prem_stop:
+                pct = (mark / entry_px - 1) * 100 if entry_px else 0
+                reason = f"Premium stop hit ({pct:.1f}% premium)"
+            if reason is None and _score_reverses_option(
+                _underlying_side_for_option(position), int(sig.score)
+            ):
+                reason = f"Signal reversal (score {sig.score})"
+            elif reason is None and sig.what_to_do == "EXIT NOW":
+                closed = getattr(sig, "closed_side", None)
+                if str(closed or "").upper() == _underlying_side_for_option(position):
+                    reason = sig.exit_reason or "Underlying setup exited"
+            elif reason is None and now >= SQUARE_OFF:
+                reason = "Intraday square-off at/after 15:15 IST"
         else:
-            if symbol not in chart_data:
+            if bar is None:
                 continue
-            bar = chart_data[symbol].iloc[-1]
             fill = float(bar["close"])
             side = str(position.get("side", "LONG")).upper()
             stop_hit = (
@@ -984,22 +1425,23 @@ def run_cycle(
                 if side == "LONG"
                 else float(bar["low"]) <= float(position["target"])
             )
-        reason = None
-        reversal = sig.score <= -2 if str(position.get("side", "")).upper() in {"LONG", "CE"} else sig.score >= 2
-        if option and position.get("side") == "CE":
-            reversal = sig.score <= -2
-        elif option and position.get("side") == "PE":
-            reversal = sig.score >= 2
-        if stop_hit:
-            fill = float(position["stop"]) if not option else fill
-            reason = "Stop-loss hit"
-        elif target_hit:
-            fill = float(position["target"]) if not option else fill
-            reason = "Target hit"
-        elif sig.what_to_do == "EXIT NOW" or reversal:
-            reason = f"Signal reversal (score {sig.score})"
-        elif now >= SQUARE_OFF:
-            reason = "Intraday square-off at/after 15:15 IST"
+            reversal = (
+                sig.score <= -2
+                if side == "LONG"
+                else sig.score >= 2
+            )
+            if stop_hit:
+                fill = float(position["stop"])
+                reason = "Stop-loss hit"
+            elif target_hit:
+                fill = float(position["target"])
+                reason = "Target hit"
+            elif sig.what_to_do == "EXIT NOW":
+                reason = sig.exit_reason or "Underlying setup exited"
+            elif reversal:
+                reason = f"Signal reversal (score {sig.score})"
+            elif now >= SQUARE_OFF:
+                reason = "Intraday square-off at/after 15:15 IST"
 
         if reason:
             event = close_position(state, symbol, fill, reason)
@@ -1011,6 +1453,7 @@ def run_cycle(
     session_pnl = today_pnl(state, prices)
     halt = trading_halt_reason(state, prices, daily_profit_target, daily_loss_limit)
     if halt:
+        arm_loss_halt(state, halt)
         reason = halt[0].upper() + halt[1:]
         for symbol in list(state["open_positions"]):
             if symbol not in prices:
@@ -1025,6 +1468,22 @@ def run_cycle(
         save_state(state)
         return events
 
+    if trading_policy.entry_block_reason(state):
+        save_state(state)
+        return events
+
+    entry_halt = session_entry_block_reason(
+        state,
+        prices,
+        daily_profit_target,
+        daily_loss_limit,
+        chart_data,
+    )
+    if entry_halt:
+        save_state(state)
+        return events
+
+    pe_block = trading_policy.block_new_pe_reason(chart_data)
     slots = max(0, int(max_positions) - len(state["open_positions"]))
     if slots == 0:
         save_state(state)
@@ -1042,11 +1501,15 @@ def run_cycle(
         contract = candidate_contracts.get(symbol)
         if contract is None:
             continue
+        if pe_block and str(contract.option_type).upper() == "PE":
+            continue
         timestamp = pd.Timestamp(chart_data[symbol].index[-1]).isoformat()
         signal_key = f"{symbol}|{timestamp}|{contract.option_type}"
         if signal_key in state["seen_entries"]:
             continue
         if _already_exited_this_move(state, symbol, sig):
+            continue
+        if _loss_reentry_blocked(state, symbol):
             continue
         if sig.confidence >= minimum_confidence:
             candidates.append((sig.confidence, abs(sig.score), symbol, side, signal_key))
@@ -1071,6 +1534,9 @@ def run_cycle(
             sig.score,
             signal_key,
             contract=contract,
+            spot_at_entry=sig.price,
+            underlying_stop=sig.stop_loss,
+            underlying_target=sig.target,
         )
         if event:
             events.append(event)

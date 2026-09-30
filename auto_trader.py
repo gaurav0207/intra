@@ -20,10 +20,14 @@ import time
 
 import adaptive_policy
 import kite_client
+import live_kite
+import trading_policy
+import kite_ws
 import options
 import paper_trader
 import scanner
-from data import IST, kite_health, market_status
+from data import IST, fetch_index, kite_health, market_status
+from indicators import compute_all
 from signals import entry_side
 
 
@@ -46,7 +50,7 @@ def _kite():
 
 
 def cycle(settings: dict) -> list[dict]:
-    state = paper_trader.load_state(settings["initial_cash"])
+    state = paper_trader.load_state()
     kite_alert = paper_trader.sync_kite_requirement(state, settings["require_kite"])
     if kite_alert is not None:
         sent, detail = kite_alert
@@ -85,6 +89,14 @@ def cycle(settings: dict) -> list[dict]:
     if failed:
         log(f"No data for: {', '.join(failed)}")
 
+    if kite is not None:
+        try:
+            raw_index = fetch_index(interval=settings["interval"], kite=kite)
+            if not raw_index.empty:
+                candles["NIFTY 50"] = compute_all(raw_index)
+        except Exception:  # noqa: BLE001
+            pass
+
     wanted: dict[str, tuple[str, float]] = {}
     for symbol, sig in signals.items():
         side = entry_side(sig)
@@ -94,7 +106,9 @@ def cycle(settings: dict) -> list[dict]:
     top = sorted(wanted, key=lambda s: -signals[s].confidence)[:12]
     contracts = options.resolve_many(kite, {s: wanted[s] for s in top}) if kite else {}
     if wanted and not contracts:
-        log("No NFO ATM contracts resolved (need a live Kite session for options).")
+        log(
+            "No NFO ATM contracts resolved (Kite session, DTE window, or illiquid premium)."
+        )
     elif contracts:
         log(
             "Options mapped: "
@@ -107,12 +121,35 @@ def cycle(settings: dict) -> list[dict]:
         for pos in state["open_positions"].values()
         if pos.get("contract")
     ]
+    if kite:
+        kite_ws.start()
+        ws_tokens = [
+            int(pos["instrument_token"])
+            for pos in state["open_positions"].values()
+            if pos.get("instrument_token")
+        ]
+        for contract in contracts.values():
+            ws_tokens.append(int(contract.instrument_token))
+        if ws_tokens:
+            kite_ws.subscribe_tokens(ws_tokens)
     if kite and open_contracts:
-        ltps = options.fetch_option_ltps(kite, open_contracts)
-        for symbol, pos in state["open_positions"].items():
-            last = ltps.get(pos.get("contract", ""))
-            if last:
-                option_marks[symbol] = last
+        if live_kite.is_enabled(state):
+            exit_marks = options.fetch_option_exit_marks(kite, open_contracts)
+            for symbol, pos in state["open_positions"].items():
+                mark = exit_marks.get(str(pos.get("contract") or ""))
+                if mark:
+                    option_marks[symbol] = mark
+        else:
+            token_map = {
+                pos["contract"]: int(pos["instrument_token"])
+                for pos in state["open_positions"].values()
+                if pos.get("contract") and pos.get("instrument_token")
+            }
+            ltps = options.fetch_option_ltps(kite, open_contracts, instrument_tokens=token_map)
+            for symbol, pos in state["open_positions"].items():
+                last = ltps.get(pos.get("contract", ""))
+                if last:
+                    option_marks[symbol] = last
 
     status = market_status()
     prices = {sym: sig.price for sym, sig in signals.items()}
@@ -148,11 +185,17 @@ def cycle(settings: dict) -> list[dict]:
     for ok, detail in intents:
         log(f"Intent/plan email {'sent' if ok else 'failed'}: {detail}")
 
-    halt = paper_trader.trading_halt_reason(
-        state, prices, plan.daily_profit_target, plan.daily_loss_limit
+    halt = paper_trader.session_entry_block_reason(
+        state, prices, plan.daily_profit_target, plan.daily_loss_limit, candles
     )
     if halt:
         log(f"Session halt active — no new entries: {halt}")
+    pe_block = trading_policy.block_new_pe_reason(candles)
+    if pe_block:
+        log(pe_block)
+    entry_block = trading_policy.entry_block_reason(state)
+    if entry_block:
+        log(f"Entry cooldown: {entry_block}")
 
     auto_on = bool(state.get("auto_trading_enabled", True))
     if not auto_on:
@@ -176,6 +219,18 @@ def cycle(settings: dict) -> list[dict]:
     )
 
     for event in events:
+        if event.get("type") == "EXIT_WORKING":
+            log(
+                f"EXIT order Open {event.get('contract') or event.get('symbol')} "
+                f"(Zerodha has not filled it yet)"
+            )
+            continue
+        if event.get("type") == "ORDER_CLOSED":
+            log(f"ENTRY Closed {event.get('contract') or event.get('symbol')}: {event.get('reason')}")
+            continue
+        if event.get("type") == "EXIT_FAILED":
+            log(f"EXIT failed {event.get('contract') or event.get('symbol')}: {event.get('error')}")
+            continue
         if event["type"] in {"BUY", "SHORT"}:
             label = event.get("contract") or event["symbol"]
             log(
@@ -232,7 +287,7 @@ def loop(settings: dict) -> None:
     )
     while True:
         now = dt.datetime.now(IST)
-        state = paper_trader.load_state(settings["initial_cash"])
+        state = paper_trader.load_state()
         try:
             login_url = kite_client.login_url()
         except Exception as exc:  # noqa: BLE001
@@ -263,7 +318,7 @@ def loop(settings: dict) -> None:
         # Exits must keep running until square-off, so the loop stays awake
         # past the entry cut-off.
         if now.time() >= paper_trader.SQUARE_OFF:
-            state = paper_trader.load_state(settings["initial_cash"])
+            state = paper_trader.load_state()
             if not state["open_positions"]:
                 wait = seconds_until(dt.time(9, 15))
                 log(f"Session done, all flat. Sleeping {wait / 3600:.1f}h.")
@@ -294,7 +349,10 @@ def main() -> int:
     mode.add_argument("--loop", action="store_true", help="Run continuously through the session.")
     mode.add_argument("--once", action="store_true", help="Run a single scan, then exit.")
     parser.add_argument("--interval", default="5m", choices=["1m", "5m", "15m"])
-    parser.add_argument("--cash", default=os.getenv("PAPER_INITIAL_CASH", "100000"))
+    parser.add_argument(
+        "--cash",
+        default=os.getenv("PAPER_INITIAL_CASH", str(int(paper_trader.default_initial_cash()))),
+    )
     parser.add_argument("--stop-mult", default="1.5")
     parser.add_argument("--target-mult", default="2.5")
     parser.add_argument("--every", default=os.getenv("PAPER_INTERVAL_SECONDS", "60"))

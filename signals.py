@@ -50,6 +50,8 @@ class Signal:
     tomorrow_session: str = ""
     confidence: int = 0
     data_source: str = "yahoo"
+    # When what_to_do is EXIT NOW, the simulator just closed this side on the last bar.
+    closed_side: Optional[str] = None
 
 
 def entry_side(sig: "Signal") -> Optional[str]:
@@ -301,6 +303,7 @@ def generate_signal(
     position = None  # dict: side, entry, stop, target, entered_at, entry_idx
     last_event = None  # "entered" | "exited" on the latest bar
     last_exit_reason = None
+    last_closed_side: Optional[str] = None
     prev_score = 0
 
     start = 21
@@ -351,6 +354,7 @@ def generate_signal(
                     position["stop"] = min(position["stop"], trail_stop)
 
             if event == "exited":
+                last_closed_side = position["side"]
                 position = None
 
         if position is None and event != "exited" and atr and atr > 0 and no_entry_before <= bar_t < no_entry_after:
@@ -485,6 +489,7 @@ def generate_signal(
         playbook=playbook,
         confidence=conf,
         data_source=source,
+        closed_side=last_closed_side if last_event == "exited" else None,
     )
 
 

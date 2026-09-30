@@ -1,4 +1,6 @@
 import os
+import time
+from datetime import timedelta
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -9,8 +11,10 @@ from streamlit_autorefresh import st_autorefresh
 import adaptive_policy
 import kite_client
 import live_kite
+import trading_policy
 import options
 import paper_trader
+import pnl_realtime
 import scanner
 from data import kite_health, market_status, next_session_label
 from signals import entry_side
@@ -117,7 +121,7 @@ initial_cash = st.sidebar.number_input(
     "Starting paper cash (₹)",
     min_value=5_000,
     max_value=10_000_000,
-    value=100_000,
+    value=int(paper_trader.default_initial_cash()),
     step=5_000,
     disabled=paper_trader.STATE_PATH.exists(),
 )
@@ -144,7 +148,7 @@ if paper_trader.email_ready():
             st.sidebar.error(detail)
 else:
     st.sidebar.warning("Email alerts not configured — trades will still be recorded")
-paper_state = paper_trader.load_state(float(initial_cash))
+paper_state = paper_trader.load_state()
 
 _auto_saved = bool(paper_state.get("auto_trading_enabled", True))
 _live_saved = bool(paper_state.get("live_trading_enabled", False))
@@ -168,20 +172,36 @@ if auto_trading != _auto_saved or live_trading != _live_saved:
 if not auto_trading:
     st.sidebar.warning("Automatic trading OFF — no new entries until you turn this on.")
 if live_trading:
+    _funds = live_kite.fund_snapshot(paper_state, force=True)
+    _fund_src = "Zerodha equity margin" if _funds["source"] == "kite" else "configured cap"
     st.sidebar.error(
         "Real Zerodha orders ON. You can lose money. "
-        f"Cap ₹{live_kite.capital_limit():,.0f} · "
-        f"deployed ₹{live_kite.deployed_premium(paper_state):,.0f} · "
-        f"free ₹{live_kite.remaining_capital(paper_state):,.0f}"
+        f"Cap ₹{_funds['cap']:,.0f} · "
+        f"deployed ₹{_funds['deployed']:,.0f} · "
+        f"free ₹{_funds['free']:,.0f} ({_fund_src})"
     )
 else:
     st.sidebar.caption(live_kite.status_line(paper_state))
 
+st.sidebar.caption(trading_policy.policy_summary())
+if trading_policy.entry_block_reason(paper_state):
+    st.sidebar.warning(trading_policy.entry_block_reason(paper_state))
+
 st.sidebar.caption(
-    f"Paper cash ₹{paper_state['cash']:,.2f} · "
-    f"{len(paper_state['open_positions'])} open · "
-    f"{len(trade_universe)} underlyings · NFO options"
+    f"Paper cash ₹{float(paper_state['cash']):,.2f} · "
+    f"starting ₹{float(paper_state.get('initial_cash', paper_state['cash'])):,.2f} · "
+    f"{len(paper_state['open_positions'])} open · NFO options"
 )
+try:
+    import kite_ws
+
+    if kite_ws.is_running():
+        st.sidebar.caption("Zerodha WebSocket LTP stream: connected")
+    elif kite_ok:
+        if kite_ws.start():
+            st.sidebar.caption("Zerodha WebSocket LTP stream: connected")
+except Exception:
+    pass
 st.sidebar.caption(
     f"Entries {paper_trader.ENTRY_START:%H:%M}–{paper_trader.ENTRY_END:%H:%M} IST · "
     f"square-off {paper_trader.SQUARE_OFF:%H:%M} IST"
@@ -241,6 +261,16 @@ signals, chart_data, errors = run_scan(
 )
 
 kite_client_for_health = kite_client.make_kite(token_key) if token_key else None
+if kite_client_for_health:
+    try:
+        from data import fetch_index
+        from indicators import compute_all
+
+        raw_index = fetch_index(interval=interval, kite=kite_client_for_health)
+        if not raw_index.empty:
+            chart_data["NIFTY 50"] = compute_all(raw_index)
+    except Exception:  # noqa: BLE001
+        pass
 kite_data_ok, kite_data_reason = kite_health(kite_client_for_health)
 if kite_data_ok and signals and all(sig.data_source != "kite" for sig in signals.values()):
     kite_data_ok = False
@@ -301,18 +331,42 @@ open_contracts = [
     if pos.get("contract")
 ]
 if kite_client_for_health and open_contracts:
-    ltps = options.fetch_option_ltps(kite_client_for_health, open_contracts)
-    for symbol, pos in paper_state["open_positions"].items():
-        last = ltps.get(pos.get("contract", ""))
-        if last:
-            option_marks[symbol] = last
-            prices[symbol] = last
+    if live_kite.is_enabled(paper_state):
+        exit_marks = options.fetch_option_exit_marks(
+            kite_client_for_health, open_contracts
+        )
+        for symbol, pos in paper_state["open_positions"].items():
+            mark = exit_marks.get(str(pos.get("contract") or ""))
+            if mark:
+                option_marks[symbol] = mark
+                prices[symbol] = mark
+    else:
+        token_map = {
+            pos["contract"]: int(pos["instrument_token"])
+            for pos in paper_state["open_positions"].values()
+            if pos.get("contract") and pos.get("instrument_token")
+        }
+        ltps = options.fetch_option_ltps(
+            kite_client_for_health, open_contracts, instrument_tokens=token_map
+        )
+        for symbol, pos in paper_state["open_positions"].items():
+            last = ltps.get(pos.get("contract", ""))
+            if last:
+                option_marks[symbol] = last
+                prices[symbol] = last
+zerodha_snap: dict | None = None
+if live_kite.is_enabled(paper_state) and kite_client_for_health:
+    zerodha_snap = live_kite.zerodha_portfolio_snapshot(
+        paper_state, force_refresh=True
+    )
+    prices = live_kite.apply_broker_marks_to_prices(paper_state, prices, zerodha_snap)
+st.session_state["_pnl_base_prices"] = dict(prices)
 adaptive_plan = adaptive_policy.decide(
     paper_state, tradable_signals, chart_data, prices, contracts=contracts
 )
 if headless_executor:
     paper_events = []
-    paper_state = paper_trader.load_state(float(initial_cash))
+    paper_state = paper_trader.load_state()
 else:
     paper_events = paper_trader.run_cycle(
         paper_state,
@@ -330,7 +384,6 @@ else:
         daily_profit_target=adaptive_plan.daily_profit_target,
         daily_loss_limit=adaptive_plan.daily_loss_limit,
     )
-paper_summary = paper_trader.portfolio_summary(paper_state, prices)
 
 st.subheader("Paper portfolio — simulated NFO options only")
 if not paper_state.get("auto_trading_enabled", True):
@@ -356,12 +409,83 @@ elif _now_ist >= paper_trader.ENTRY_END:
     st.caption(f"Entry window closed at {paper_trader.ENTRY_END:%H:%M} IST — exits only until square-off.")
 else:
     st.caption(f"Entry window open until {paper_trader.ENTRY_END:%H:%M} IST.")
-p1, p2, p3, p4, p5 = st.columns(5)
-p1.metric("Total equity", f"₹{paper_summary['equity']:,.2f}", f"₹{paper_summary['total_pnl']:+,.2f}")
-p2.metric("Cash", f"₹{paper_summary['cash']:,.2f}")
-p3.metric("Invested value", f"₹{paper_summary['market_value']:,.2f}")
-p4.metric("Realized P&L", f"₹{paper_summary['realized_pnl']:+,.2f}")
-p5.metric("Open P&L", f"₹{paper_summary['unrealized_pnl']:+,.2f}")
+
+
+@st.fragment(run_every=timedelta(seconds=pnl_realtime.PNL_REFRESH_SECONDS))
+def render_realtime_pnl() -> None:
+    state = paper_trader.load_state()
+    paper_trader.sync_with_broker(state)
+    state = paper_trader.load_state()
+    base = st.session_state.get("_pnl_base_prices") or {}
+    prices, mark_note = pnl_realtime.ws_prices_for_state(state, base)
+    summary = paper_trader.portfolio_summary(state, prices)
+
+    st.markdown("#### Paper P&L (live marks)")
+    st.caption(mark_note)
+    p1, p2, p3, p4, p5 = st.columns(5)
+    p1.metric(
+        "Total equity",
+        f"₹{summary['equity']:,.2f}",
+        f"₹{summary['total_pnl']:+,.2f}",
+    )
+    p2.metric("Cash", f"₹{summary['cash']:,.2f}")
+    p3.metric("Invested value", f"₹{summary['market_value']:,.2f}")
+    p4.metric("Realized P&L", f"₹{summary['realized_pnl']:+,.2f}")
+    p5.metric("Open P&L", f"₹{summary['unrealized_pnl']:+,.2f}")
+
+    leg_rows = pnl_realtime.paper_open_leg_rows(state, prices)
+    if leg_rows:
+        st.dataframe(pd.DataFrame(leg_rows), width="stretch", hide_index=True)
+
+    if not live_kite.is_enabled(state) or not st.session_state.kite_token:
+        return
+
+    st.markdown("#### Zerodha P&L")
+    now = time.time()
+    if now - float(st.session_state.get("z_snap_at") or 0) > pnl_realtime.BROKER_LEGS_REFRESH_SECONDS:
+        st.session_state["z_snap"] = live_kite.zerodha_portfolio_snapshot(
+            state, force_refresh=True
+        )
+        st.session_state["z_snap_at"] = now
+    z_snap = st.session_state.get("z_snap") or {}
+
+    if now - float(st.session_state.get("broker_legs_at") or 0) > pnl_realtime.BROKER_LEGS_REFRESH_SECONDS:
+        try:
+            kite = kite_client.make_kite(st.session_state.kite_token)
+            st.session_state["broker_legs"] = pnl_realtime.fetch_broker_open_legs(kite)
+            st.session_state["broker_legs_at"] = now
+        except Exception as exc:  # noqa: BLE001
+            st.session_state["broker_legs_error"] = str(exc)
+
+    broker_legs = st.session_state.get("broker_legs") or []
+    broker_open, broker_rows, broker_note = pnl_realtime.broker_open_pnl_from_ws(broker_legs)
+
+    if z_snap and not z_snap.get("error"):
+        st.caption(
+            f"Margin snapshot {z_snap.get('fetched_at', '—')} (refreshed ~"
+            f"{pnl_realtime.BROKER_LEGS_REFRESH_SECONDS}s) · "
+            f"Open leg marks: **{broker_note}** every {pnl_realtime.PNL_REFRESH_SECONDS}s"
+        )
+        z1, z2, z3, z4, z5 = st.columns(5)
+        z1.metric("Total equity", f"₹{z_snap['equity']:,.2f}")
+        z2.metric("Cash (margin)", f"₹{z_snap['cash']:,.2f}")
+        z3.metric("Invested (NFO)", f"₹{z_snap['invested_value']:,.2f}")
+        z4.metric("Realized today", f"₹{z_snap['realized_pnl_today']:+,.2f}")
+        z5.metric("Open P&L (live)", f"₹{broker_open:+,.2f}")
+        st.caption(
+            f"Day P&L (Kite day book): ₹{z_snap.get('day_pnl', 0):+,.2f} · "
+            f"REST open P&L at snapshot: ₹{z_snap.get('open_pnl', 0):+,.2f}"
+        )
+    elif z_snap.get("error"):
+        st.warning(f"Zerodha margin snapshot: {z_snap['error']}")
+
+    if broker_rows:
+        st.dataframe(pd.DataFrame(broker_rows), width="stretch", hide_index=True)
+    elif live_kite.is_enabled(state):
+        st.caption("No open NFO MIS legs on Zerodha.")
+
+
+render_realtime_pnl()
 
 if paper_events:
     for event in paper_events:
@@ -409,11 +533,31 @@ if plan_rows:
     if paper_state.get("last_option_plan_at"):
         st.caption(f"Last plan from the headless trader: {paper_state['last_option_plan_at']}")
 else:
-    st.caption("No ATM option is sized for a fill on this cycle.")
+    watch_rows = paper_trader.option_watch_rows(
+        tradable_signals,
+        contracts,
+        adaptive_plan.confidence_required,
+        adaptive_plan.regime,
+    )
+    if watch_rows and not session_halt:
+        st.caption(
+            "No premium sized for a fill this refresh — closest entry-eligible setups:"
+        )
+        st.dataframe(pd.DataFrame(watch_rows), width="stretch", hide_index=True)
+    else:
+        st.caption("No ATM option is sized for a fill on this cycle.")
+        if not session_halt:
+            st.caption(
+                "The scan has no **ENTER/HOLD** short/long with room left toward target "
+                "(high-confidence **WAIT** rows in the table above are not buy signals yet)."
+            )
 
+paper_trader.sync_with_broker(paper_state)
+paper_state = paper_trader.load_state()
 if paper_state["open_positions"]:
     position_rows = []
     for symbol, position in paper_state["open_positions"].items():
+        status = str(position.get("order_status") or "Open")
         current = float(position["entry_price"])
         if position.get("contract"):
             mark = float(prices.get(symbol, position["entry_price"]))
@@ -421,33 +565,44 @@ if paper_state["open_positions"]:
             current = entry if mark > max(entry * 8, entry + 50) else mark
         else:
             current = float(prices.get(symbol, position["entry_price"]))
+        entry_px = float(position["entry_price"])
         if position.get("contract") or position.get("side") in {"CE", "PE"}:
-            pnl = (current - position["entry_price"]) * position["quantity"]
+            pnl = (current - entry_px) * position["quantity"]
         elif position.get("side", "LONG") == "SHORT":
-            pnl = (position["entry_price"] - current) * position["quantity"]
+            pnl = (entry_px - current) * position["quantity"]
         else:
             pnl = current * position["quantity"] - position["amount_invested"]
+        invested = float(position.get("amount_invested") or 0)
+        pnl_pct = (pnl / invested) * 100 if invested and status == "Executed" else None
         position_rows.append(
             {
+                "Status": status,
                 "Contract": position.get("contract", symbol),
                 "Underlying": symbol,
                 "Type": position.get("side", "LONG"),
                 "Lots": position.get("lots", position["quantity"]),
                 "Premium in": position["entry_price"],
-                "Premium now": round(current, 2),
+                "Premium now": round(current, 2) if status == "Executed" else None,
                 "Paid": position["amount_invested"],
-                "Stop": position["stop"],
-                "Target": position["target"],
-                "Open P&L": round(pnl, 2),
+                "P&L ₹": round(pnl, 2) if status == "Executed" else None,
+                "P&L %": round(pnl_pct, 2) if pnl_pct is not None else None,
                 "Entered": position["entry_time"],
             }
         )
     st.dataframe(pd.DataFrame(position_rows), width="stretch", hide_index=True)
-    st.markdown("**Manual exit (paper only)**")
-    st.caption(
-        "Uses the latest option premium shown above. You get the same instant EXIT email as the auto trader. "
-        "No real Zerodha order is placed."
-    )
+    st.markdown("**Manual exit**")
+    if live_kite.is_enabled(paper_state):
+        st.caption(
+            "Places a **Zerodha LIMIT SELL** only for qty you **already hold long** (same **MIS** product). "
+            "If Kite says **need more margin**, you may be selling more than your open long (naked short) — "
+            "use Kite → Positions and exit **exactly** that qty with **Limit**, not Market. "
+            "Paper closes only after the broker order is accepted."
+        )
+    else:
+        st.caption(
+            "Paper only — uses the latest option premium shown above. "
+            "Turn on live mirroring in the sidebar to send matching LIMIT exits to Zerodha."
+        )
     exit_all_col, _ = st.columns([1, 3])
     with exit_all_col:
         exit_all = st.button(
@@ -464,10 +619,15 @@ if paper_state["open_positions"]:
         if exited:
             for event in exited:
                 label = event.get("contract") or event["symbol"]
-                st.success(
-                    f"Exited {label} @ ₹{event['exit_price']:,.2f} · "
-                    f"P&L ₹{event['pnl']:+,.2f}"
-                )
+                if event.get("type") == "EXIT_FAILED":
+                    st.error(f"Zerodha exit blocked for {label}: {event.get('error')}")
+                elif event.get("type") == "EXIT_WORKING":
+                    st.info(f"{label}: exit order is Open at Zerodha (not filled yet).")
+                else:
+                    st.success(
+                        f"Exited {label} @ ₹{event['exit_price']:,.2f} · "
+                        f"P&L ₹{event['pnl']:+,.2f}"
+                    )
             st.rerun()
         else:
             st.warning("Nothing to exit — reload the page if a position just closed.")
@@ -483,10 +643,15 @@ if paper_state["open_positions"]:
                 )
                 if exited:
                     event = exited[0]
-                    st.success(
-                        f"Exited {label} @ ₹{event['exit_price']:,.2f} · "
-                        f"P&L ₹{event['pnl']:+,.2f}"
-                    )
+                    if event.get("type") == "EXIT_FAILED":
+                        st.error(f"Zerodha exit blocked: {event.get('error')}")
+                    elif event.get("type") == "EXIT_WORKING":
+                        st.info(f"{label}: exit order is Open at Zerodha (not filled yet).")
+                    else:
+                        st.success(
+                            f"Exited {label} @ ₹{event['exit_price']:,.2f} · "
+                            f"P&L ₹{event['pnl']:+,.2f}"
+                        )
                     st.rerun()
                 else:
                     st.warning("Could not exit — the position may already be closed.")
@@ -532,11 +697,24 @@ with st.expander("Why the adaptive engine chose these limits"):
 with st.expander("Paper trade history and records"):
     if paper_state["trades"]:
         history = pd.DataFrame(paper_state["trades"])
+        if "order_status" not in history.columns:
+            history["order_status"] = "Closed"
+        else:
+            history["order_status"] = history["order_status"].fillna("Closed")
         columns = [
-            "symbol", "quantity", "entry_price", "exit_price", "amount_invested",
-            "proceeds", "pnl", "pnl_pct", "entry_time", "exit_time", "exit_reason",
+            "order_status", "symbol", "contract", "quantity", "entry_price", "exit_price",
+            "amount_invested", "proceeds", "pnl", "pnl_pct", "entry_time", "exit_time", "exit_reason",
         ]
-        st.dataframe(history[[c for c in columns if c in history.columns]], width="stretch", hide_index=True)
+        show_hist = history[[c for c in columns if c in history.columns]].rename(
+            columns={
+                "order_status": "Status",
+                "symbol": "Underlying",
+                "contract": "Contract",
+                "pnl": "P&L ₹",
+                "pnl_pct": "P&L %",
+            }
+        )
+        st.dataframe(show_hist, width="stretch", hide_index=True)
     else:
         st.caption("No completed paper trades yet.")
     if paper_trader.STATE_PATH.exists():
