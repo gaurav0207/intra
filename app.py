@@ -109,6 +109,29 @@ def _render_nfo_buy_charts(kite, targets: list[dict], key_prefix: str) -> None:
     )
 
 
+def _veto_suggestion(symbol: str, option_type: str, contract: str = "") -> None:
+    fresh = paper_trader.load_state()
+    paper_trader.veto_setup(fresh, symbol, option_type, contract=str(contract or ""))
+    st.info(f"Vetoed {contract or symbol} for today. The bot will look at the next name.")
+    st.rerun()
+
+
+def _render_today_vetoes(state: dict) -> None:
+    keys = paper_trader.today_vetoes(state)
+    if not keys:
+        return
+    st.caption("Vetoed today (bot will skip these and rank the next setup):")
+    cols = st.columns(min(4, len(keys)))
+    for idx, key in enumerate(keys):
+        parts = str(key).split("|")
+        label = f"{parts[1]} {parts[2]}" if len(parts) >= 3 else key
+        with cols[idx % len(cols)]:
+            if st.button(f"Undo {label}", key=f"unveto_{key}"):
+                fresh = paper_trader.load_state()
+                paper_trader.clear_veto(fresh, key)
+                st.rerun()
+
+
 def _show_manual_enter_result(event: dict | None, err: str, label: str) -> None:
     if event:
         st.success(
@@ -766,6 +789,43 @@ if open_auction.enabled() and (auction_plan or open_auction.in_prep_window() or 
                             fresh, row, kite_client_for_health
                         )
                         _show_manual_enter_result(event, err, label)
+                    if st.button(
+                        f"Veto {label}",
+                        key=f"veto_auction_{row.get('underlying')}_{label}",
+                    ):
+                        _veto_suggestion(
+                            str(row.get("underlying")),
+                            str(row.get("option_type") or ""),
+                            label,
+                        )
+        skippable = [
+            r
+            for r in auction_plan
+            if r.get("underlying") not in taken
+            and not paper_trader.is_vetoed(
+                paper_state, str(r.get("underlying")), str(r.get("option_type") or "")
+            )
+            and not any(
+                r.get("underlying") == ready_row.get("underlying")
+                for ready_row, _ in auction_ready
+            )
+        ]
+        if skippable:
+            st.caption("Veto a name so auction looks at the next tape:")
+            vcols = st.columns(min(4, len(skippable)))
+            for idx, row in enumerate(skippable):
+                label = str(row.get("tradingsymbol") or row.get("underlying"))
+                with vcols[idx % len(vcols)]:
+                    if st.button(
+                        f"Veto {label}",
+                        key=f"veto_auction_watch_{row.get('underlying')}_{label}",
+                    ):
+                        _veto_suggestion(
+                            str(row.get("underlying")),
+                            str(row.get("option_type") or ""),
+                            label,
+                        )
+        _render_today_vetoes(paper_state)
     elif open_auction.in_prep_window():
         st.caption("Arming overnight ATM list… headless trader builds this from 09:00 IST.")
     else:
@@ -857,7 +917,7 @@ def render_will_buy_next() -> None:
             and row.get("Underlying") in chosen
         ]
         if ready:
-            st.markdown("**Enter now** — the book wants these; you confirm the fill.")
+            st.markdown("**Enter now** — or **Veto** so the next-best name can take the slot.")
             if live_kite.is_enabled(state):
                 st.caption("Live mirroring is ON — this button also sends the Zerodha MIS buy.")
             cols = st.columns(min(3, len(ready)))
@@ -887,6 +947,31 @@ def render_will_buy_next() -> None:
                             extra={"entry_style": "manual", "manual_reason": row.get("Status")},
                         )
                         _show_manual_enter_result(event, err, label)
+                    if st.button(
+                        f"Veto {label}",
+                        key=f"veto_willbuy_{symbol}_{label}",
+                    ):
+                        _veto_suggestion(symbol, str(row.get("Type") or ""), label)
+        watching = [
+            row
+            for row in plan_rows
+            if not str(row.get("Status") or "").startswith("WILL BUY")
+            and row.get("Underlying")
+            and row.get("Type")
+        ]
+        if watching:
+            st.caption("Veto a spike so it drops and the next name can surface:")
+            wcols = st.columns(min(4, len(watching)))
+            for idx, row in enumerate(watching):
+                symbol = str(row["Underlying"])
+                label = str(row.get("Contract") or symbol)
+                with wcols[idx % len(wcols)]:
+                    if st.button(
+                        f"Veto {label}",
+                        key=f"veto_watch_{symbol}_{label}",
+                    ):
+                        _veto_suggestion(symbol, str(row.get("Type") or ""), label)
+        _render_today_vetoes(state)
         if ctx.get("last_plan_at"):
             st.caption(f"Last plan from the headless trader: {ctx['last_plan_at']}")
     else:
@@ -895,12 +980,24 @@ def render_will_buy_next() -> None:
             search,
             int(ctx.get("confidence") or 0),
             str(ctx.get("regime") or ""),
+            state=state,
         )
         if watch_rows and not halt:
             st.caption(
                 "No premium sized for a fill this refresh — closest entry-eligible setups:"
             )
             st.dataframe(pd.DataFrame(watch_rows), width="stretch", hide_index=True)
+            vcols = st.columns(min(4, len(watch_rows)))
+            for idx, row in enumerate(watch_rows):
+                symbol = str(row.get("Underlying") or "")
+                label = str(row.get("Contract") or symbol)
+                side = str(row.get("Side") or "")
+                option_type = "PE" if side == "SHORT" else "CE"
+                if not symbol:
+                    continue
+                with vcols[idx % len(vcols)]:
+                    if st.button(f"Veto {label}", key=f"veto_closest_{symbol}_{label}"):
+                        _veto_suggestion(symbol, option_type, label)
             watch_charts = []
             for row in watch_rows:
                 contract = search.get(row.get("Underlying"))

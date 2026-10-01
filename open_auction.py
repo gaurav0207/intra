@@ -626,11 +626,21 @@ def diagnose(
     index_df=None,
 ) -> dict[str, Any]:
     """Dashboard/trader status that matches what try_entries will actually do."""
+    import paper_trader
+
     ok, why, premium, spot, conf = evaluate_candidate(row, kite, index_df)
     symbol = str(row.get("underlying") or "")
     taken = set((state or {}).get("open_auction_taken") or [])
+    vetoed = bool(
+        state is not None
+        and paper_trader.is_vetoed(state, symbol, str(row.get("option_type") or ""))
+    )
     if symbol in taken or symbol in ((state or {}).get("open_positions") or {}):
         status = "TAKEN"
+    elif vetoed:
+        status = "VETOED"
+        why = "vetoed for today"
+        ok = False
     elif not in_entry_window():
         status = "MISSED — window closed" if ok else "watching"
         if ok:
@@ -646,7 +656,9 @@ def diagnose(
             status = "READY TO BUY"
     return {
         "ok": bool(ok and status == "READY TO BUY"),
-        "manual_ok": bool(ok) and symbol not in taken
+        "manual_ok": bool(ok)
+        and not vetoed
+        and symbol not in taken
         and symbol not in ((state or {}).get("open_positions") or {}),
         "status": status,
         "why": why or "—",
@@ -703,6 +715,8 @@ def try_entries(state: dict[str, Any], kite) -> list[dict[str, Any]]:
         if symbol in state.get("open_positions", {}):
             continue
         if symbol in taken:
+            continue
+        if paper_trader.is_vetoed(state, symbol, str(row.get("option_type") or "")):
             continue
         key = f"{symbol}|{today}|{row['option_type']}|OPEN_AUCTION"
         if key in (state.get("seen_entries") or []):
@@ -776,6 +790,8 @@ def manual_enter(state: dict[str, Any], row: dict[str, Any], kite=None) -> tuple
     symbol = str(row["underlying"])
     if symbol in (state.get("open_positions") or {}):
         return None, "already in the book"
+    if paper_trader.is_vetoed(state, symbol, str(row.get("option_type") or "")):
+        return None, "vetoed for today — pick another name"
     contract = plan_to_contract(row, premium)
     if contract is None:
         return None, "premium too small"

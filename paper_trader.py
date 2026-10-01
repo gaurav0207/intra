@@ -69,6 +69,7 @@ def new_state(initial_cash: float) -> dict[str, Any]:
         "open_auction_spots": [],
         "open_auction_date": "",
         "open_auction_taken": [],
+        "vetoed_setups": [],
         "updated_at": _now(),
     }
 
@@ -107,6 +108,7 @@ def load_state(initial_cash: float | None = None) -> dict[str, Any]:
         state.setdefault("open_auction_spots", [])
         state.setdefault("open_auction_date", "")
         state.setdefault("open_auction_taken", [])
+        state.setdefault("vetoed_setups", [])
         state.setdefault("initial_cash", float(initial_cash))
         state.setdefault("cash", float(initial_cash))
         state["_loaded_at"] = _now()
@@ -146,6 +148,7 @@ def save_state(state: dict[str, Any]) -> None:
                     "open_auction_spots",
                     "open_auction_date",
                     "open_auction_taken",
+                    "vetoed_setups",
                 ):
                     if key in disk:
                         state[key] = disk[key]
@@ -180,6 +183,7 @@ def reset_state(initial_cash: float) -> dict[str, Any]:
     state["events"] = []
     state["seen_entries"] = []
     state["seen_intents"] = []
+    state["vetoed_setups"] = []
     state["open_positions"] = {}
     save_state(state)
     return state
@@ -493,6 +497,8 @@ def option_plan_rows(
             continue
         if sig.confidence < minimum_confidence:
             continue
+        if is_vetoed(state, symbol, contract.option_type):
+            continue
         if entry_side(sig) is None or _already_exited_this_move(state, symbol, sig):
             continue
         budget = float(budgets.get(symbol, 0))
@@ -551,6 +557,7 @@ def option_watch_rows(
     contracts: dict[str, Any],
     minimum_confidence: int,
     regime: str,
+    state: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """When nothing is sized yet, show eligible underlyings and why they are not filling."""
     rows: list[dict[str, Any]] = []
@@ -559,6 +566,8 @@ def option_watch_rows(
         if side is None:
             continue
         contract = contracts.get(symbol)
+        if contract is not None and is_vetoed(state, symbol, contract.option_type):
+            continue
         blockers: list[str] = []
         if sig.confidence < minimum_confidence:
             blockers.append(f"confidence {sig.confidence}% < {minimum_confidence}% ({regime})")
@@ -731,6 +740,60 @@ def notify_watch_and_intents(
 def _record_event(state: dict[str, Any], event: dict[str, Any]) -> None:
     state["events"].append(event)
     state["events"] = state["events"][-1000:]
+
+
+def _today_date() -> str:
+    return pd.Timestamp.now(tz=IST).strftime("%Y-%m-%d")
+
+
+def veto_key(symbol: str, option_type: str, day: str | None = None) -> str:
+    return f"{day or _today_date()}|{str(symbol).upper()}|{str(option_type or '').upper()}"
+
+
+def is_vetoed(state: dict[str, Any] | None, symbol: str, option_type: str) -> bool:
+    if not state:
+        return False
+    return veto_key(symbol, option_type) in (state.get("vetoed_setups") or [])
+
+
+def today_vetoes(state: dict[str, Any] | None) -> list[str]:
+    today = _today_date()
+    return [key for key in (state.get("vetoed_setups") or []) if str(key).startswith(today)]
+
+
+def veto_setup(
+    state: dict[str, Any],
+    symbol: str,
+    option_type: str,
+    contract: str = "",
+    reason: str = "manual veto",
+) -> dict[str, Any]:
+    """Skip this CE/PE for the rest of today so the next-best name can fill the slot."""
+    key = veto_key(symbol, option_type)
+    state.setdefault("events", [])
+    seen = list(state.get("vetoed_setups") or [])
+    if key not in seen:
+        seen.append(key)
+        state["vetoed_setups"] = seen[-80:]
+        event = {
+            "time": _now(),
+            "type": "VETO",
+            "symbol": symbol,
+            "option_type": str(option_type).upper(),
+            "contract": contract,
+            "reason": reason,
+            "key": key,
+        }
+        _record_event(state, event)
+        save_state(state)
+        return event
+    save_state(state)
+    return {"type": "VETO", "key": key, "symbol": symbol}
+
+
+def clear_veto(state: dict[str, Any], key: str) -> None:
+    state["vetoed_setups"] = [item for item in (state.get("vetoed_setups") or []) if item != key]
+    save_state(state)
 
 
 def auto_stop_loss_enabled(state: dict[str, Any] | None) -> bool:
@@ -1018,6 +1081,8 @@ def manual_enter_option(
     symbol = str(symbol)
     if symbol in (state.get("open_positions") or {}):
         return None, "already in the book"
+    if is_vetoed(state, symbol, getattr(contract, "option_type", "")):
+        return None, "vetoed for today — pick another name"
     if contract is None:
         return None, "no contract"
     payload = dict(extra or {})
@@ -1703,6 +1768,8 @@ def run_cycle(
         timestamp = pd.Timestamp(chart_data[symbol].index[-1]).isoformat()
         signal_key = f"{symbol}|{timestamp}|{contract.option_type}"
         if signal_key in state["seen_entries"]:
+            continue
+        if is_vetoed(state, symbol, contract.option_type):
             continue
         if _already_exited_this_move(state, symbol, sig):
             continue

@@ -133,6 +133,8 @@ def decide(
         if paper_trader._loss_reentry_blocked(state, symbol):
             continue
         contract = contracts.get(symbol)
+        if contract is not None and paper_trader.is_vetoed(state, symbol, contract.option_type):
+            continue
         if contract is None:
             continue
         if (
