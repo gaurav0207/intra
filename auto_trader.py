@@ -236,6 +236,13 @@ def cycle(settings: dict) -> list[dict]:
         if event.get("type") == "EXIT_FAILED":
             log(f"EXIT failed {event.get('contract') or event.get('symbol')}: {event.get('error')}")
             continue
+        if event.get("type") == "STOP_ASK":
+            log(
+                f"STOP ASK {event.get('contract') or event.get('symbol')} "
+                f"@ ₹{event.get('mark', 0):,.2f} — {event.get('reason')} "
+                "(not exited; waiting for dashboard Exit)"
+            )
+            continue
         if event["type"] in {"BUY", "SHORT"}:
             label = event.get("contract") or event["symbol"]
             log(

@@ -22,6 +22,105 @@ from signals import entry_side
 
 st.set_page_config(page_title="Intraday NSE Dashboard", layout="wide")
 
+
+def _cached_nfo_candles(kite, token: int, interval: str):
+    key = f"nfo_ohlcv_{int(token)}_{interval}"
+    now = time.time()
+    hit = st.session_state.get(key) or {}
+    if hit.get("df") is not None and now - float(hit.get("at") or 0) < 45:
+        return hit["df"]
+    df = options.fetch_nfo_intraday(kite, int(token), interval=interval)
+    st.session_state[key] = {"at": now, "df": df}
+    return df
+
+
+def _nfo_premium_figure(df, title: str, last: float | None = None, stop=None, target=None):
+    fig = go.Figure()
+    if df is None or df.empty:
+        return fig
+    fig.add_trace(
+        go.Candlestick(
+            x=df.index,
+            open=df["open"],
+            high=df["high"],
+            low=df["low"],
+            close=df["close"],
+            name="Premium",
+        )
+    )
+    if last and last > 0:
+        fig.add_hline(y=float(last), line_dash="solid", line_color="#7CFC9A", annotation_text=f"tape ₹{last:.2f}")
+    if stop:
+        fig.add_hline(y=float(stop), line_dash="dash", line_color="#FF8A80", annotation_text="stop")
+    if target:
+        fig.add_hline(y=float(target), line_dash="dash", line_color="#7CFC9A", annotation_text="target")
+    fig.update_layout(
+        title=title,
+        height=340,
+        xaxis_rangeslider_visible=False,
+        template="plotly_dark",
+        margin=dict(l=40, r=20, t=40, b=20),
+        showlegend=False,
+    )
+    return fig
+
+
+def _render_nfo_buy_charts(kite, targets: list[dict], key_prefix: str) -> None:
+    """Premium candles for the option that would be bought — not the stock 5m chart."""
+    if not kite or not targets:
+        return
+    uniq: dict[int, dict] = {}
+    for row in targets:
+        tok = int(row.get("token") or 0)
+        if tok > 0:
+            uniq[tok] = row
+    rows = list(uniq.values())
+    if not rows:
+        return
+    st.markdown("**NFO premium chart** — the option tape, not the stock 5m candle.")
+    labels = [str(r.get("label") or r.get("token")) for r in rows]
+    picked = (
+        labels[0]
+        if len(labels) == 1
+        else st.selectbox("Contract to inspect", labels, key=f"{key_prefix}_pick")
+    )
+    row = next((r for r in rows if str(r.get("label") or r.get("token")) == picked), rows[0])
+    interval = st.radio(
+        "Candle",
+        ("1 minute", "5 minute"),
+        horizontal=True,
+        key=f"{key_prefix}_iv",
+        help="1m shows whether the 5m stock signal is asking you to buy a premium spike.",
+    )
+    kite_iv = "minute" if interval.startswith("1") else "5minute"
+    df = _cached_nfo_candles(kite, int(row["token"]), kite_iv)
+    last = float(row.get("premium") or 0)
+    if df is None or df.empty:
+        st.caption(f"No Kite history yet for {picked}.")
+        return
+    note = options.premium_peak_note(df, last)
+    if note and "spike" in note:
+        st.error(note)
+    elif note:
+        st.caption(note)
+    st.plotly_chart(
+        _nfo_premium_figure(df, picked, last, row.get("stop"), row.get("target")),
+        width="stretch",
+    )
+
+
+def _show_manual_enter_result(event: dict | None, err: str, label: str) -> None:
+    if event:
+        st.success(
+            f"Entered {event.get('contract', label)} · "
+            f"{event.get('lots', event.get('quantity'))} lot(s) @ "
+            f"₹{event['entry_price']:,.2f} · premium ₹{event['amount_invested']:,.2f}"
+        )
+        st.rerun()
+        return
+    st.error(f"Could not enter {label}: {err}")
+
+
 DEFAULT_WATCHLIST = "RELIANCE, TCS, HDFCBANK, INFY, ICICIBANK, SBIN"
 
 # ---------------------------------------------------------------- kite --
@@ -151,27 +250,54 @@ else:
     st.sidebar.warning("Email alerts not configured — trades will still be recorded")
 paper_state = paper_trader.load_state()
 
-_auto_saved = bool(paper_state.get("auto_trading_enabled", True))
+_auto_saved = bool(paper_state.get("auto_trading_enabled", False))
 _live_saved = bool(paper_state.get("live_trading_enabled", False))
+_sl_saved = bool(paper_state.get("auto_stop_loss_exit", False))
+for _name, _saved in (
+    ("auto_trading", _auto_saved),
+    ("live_trading", _live_saved),
+    ("auto_stop_loss", _sl_saved),
+):
+    _disk = f"_{_name}_disk"
+    if st.session_state.get(_disk) != _saved:
+        st.session_state[_name] = _saved
+        st.session_state[_disk] = _saved
 auto_trading = st.sidebar.toggle(
     "Automatic trading",
-    value=_auto_saved,
-    help="Default ON. When OFF, the headless bot will not open new positions. "
-    "Stop/target exits and manual exits still work.",
+    key="auto_trading",
+    help="Default OFF. When ON, the bot buys without your click. "
+    "When OFF, only Enter now opens a position.",
 )
 live_trading = st.sidebar.toggle(
     "Real Zerodha orders",
-    value=_live_saved,
+    key="live_trading",
     help="When ON, paper BUY/EXIT is mirrored to your Zerodha account (₹50k premium cap). "
     "Default OFF.",
 )
-if auto_trading != _auto_saved or live_trading != _live_saved:
+auto_stop_loss = st.sidebar.toggle(
+    "Auto stop/target exit",
+    key="auto_stop_loss",
+    help="Default OFF. When OFF, stop, target, and reversal ask you to click Exit. "
+    "15:15 square-off still auto-exits MIS.",
+)
+if (
+    auto_trading != _auto_saved
+    or live_trading != _live_saved
+    or auto_stop_loss != _sl_saved
+):
     paper_state["auto_trading_enabled"] = auto_trading
     paper_state["live_trading_enabled"] = live_trading
+    paper_state["auto_stop_loss_exit"] = auto_stop_loss
     paper_trader.save_state(paper_state)
 
-if not auto_trading:
-    st.sidebar.warning("Automatic trading OFF — no new entries until you turn this on.")
+if auto_trading:
+    st.sidebar.error("Automatic trading ON — the bot will BUY without the Enter button.")
+else:
+    st.sidebar.warning("Manual entries only — the bot will not buy unless you click Enter now.")
+if not auto_stop_loss:
+    st.sidebar.warning("Manual exits — stop/target/reversal ask you. 15:15 still squares off.")
+else:
+    st.sidebar.error("Auto stop/target ON — the bot will flatten those without asking.")
 if live_trading:
     _funds = live_kite.fund_snapshot(paper_state, force=True)
     _fund_src = "Zerodha equity margin" if _funds["source"] == "kite" else "configured cap"
@@ -403,10 +529,15 @@ else:
 paper_events = list(auction_events) + list(paper_events)
 
 st.subheader("Paper portfolio — simulated NFO options only")
-if not paper_state.get("auto_trading_enabled", True):
+if paper_state.get("auto_trading_enabled"):
+    st.error(
+        "Automatic trading is **ON** — the bot will buy without **Enter now**. "
+        "Turn it OFF in the sidebar for manual execution."
+    )
+else:
     st.warning(
-        "Automatic trading is **OFF** (sidebar). The bot will not open new positions; "
-        "exits and manual closes still work."
+        "Manual execution: the bot will **not** buy unless you click **Enter now**. "
+        "Stop/target ask you to **Exit**. 15:15 IST still squares off MIS."
     )
 if live_kite.is_enabled(paper_state):
     st.error("Real Zerodha mirroring is **ON** — paper fills also send live NFO orders.")
@@ -455,6 +586,35 @@ def render_realtime_pnl() -> None:
     leg_rows = pnl_realtime.paper_open_leg_rows(state, prices)
     if leg_rows:
         st.dataframe(pd.DataFrame(leg_rows), width="stretch", hide_index=True)
+
+    asks = paper_trader.pending_stop_asks(state)
+    if asks:
+        st.error(
+            "Stop-loss hit — the bot did **not** exit. Click Exit if you want out: "
+            + ", ".join(
+                f"{a['contract']} (₹{a['mark']})" if a.get("mark") else str(a["contract"])
+                for a in asks
+            )
+        )
+        ask_cols = st.columns(min(3, len(asks)))
+        for idx, ask in enumerate(asks):
+            with ask_cols[idx % len(ask_cols)]:
+                if st.button(
+                    f"Exit {ask['contract']}",
+                    type="primary",
+                    key=f"stop_ask_exit_{ask['symbol']}",
+                ):
+                    exited = paper_trader.manual_exit_positions(
+                        [ask["symbol"]],
+                        prices,
+                        float(state.get("initial_cash") or 0),
+                        reason=str(ask.get("reason") or "Manual exit after stop ask"),
+                    )
+                    if exited:
+                        st.success(f"Exit sent for {ask['contract']}")
+                        st.rerun()
+                    else:
+                        st.warning("Could not exit — reload if it already closed.")
 
     if not live_kite.is_enabled(state) or not st.session_state.kite_token:
         return
@@ -514,6 +674,12 @@ if paper_events:
                 f"{event.get('lots', event['quantity'])} lots @ "
                 f"₹{event['entry_price']:,.2f} · premium ₹{event['amount_invested']:,.2f}"
             )
+        elif event["type"] == "STOP_ASK":
+            st.error(
+                f"Stop-loss ask: {event.get('contract', event.get('symbol'))} @ "
+                f"₹{event.get('mark', 0):,.2f} — {event.get('reason')}. "
+                "The bot did not exit. Use Exit below if you want out."
+            )
         else:
             st.info(
                 f"Paper EXIT: {event['symbol']} · received ₹{event['proceeds']:,.2f} · "
@@ -530,33 +696,76 @@ auction_plan = paper_state.get("open_auction_plan") or []
 if open_auction.enabled() and (auction_plan or open_auction.in_prep_window() or open_auction.in_entry_window()):
     st.subheader("Open auction — 09:15 option tape")
     st.caption(
-        "Pre-picked ATM from the daily bias. Buys only if the option or the underlying "
-        "has already gapped. This is not the 5-minute stock score."
+        "Pre-picked ATM from the daily bias. Auto-buy is 09:15–09:40 when the option "
+        f"has gapped and confidence is ≥{open_auction.min_confidence()}% "
+        "(a 50%+ premium gap counts). An **Enter now** button appears when the tape "
+        "says go in — including after 09:40 — so you can still take it."
     )
     if auction_plan:
         open_auction.subscribe_plan(auction_plan)
-        rows = []
+        auction_rows = []
+        auction_ready: list[tuple[dict, dict]] = []
         taken = set(paper_state.get("open_auction_taken") or [])
+        auction_index = (
+            open_auction._index_frame(kite_client_for_health)
+            if kite_client_for_health
+            else None
+        )
         for row in auction_plan:
-            fire, why, prem, spot = open_auction.evaluate_row(row, kite_client_for_health)
-            rows.append(
+            info = open_auction.diagnose(
+                row, kite_client_for_health, paper_state, auction_index
+            )
+            auction_rows.append(
                 {
                     "Contract": row.get("tradingsymbol"),
                     "Bias": row.get("bias"),
                     "Type": row.get("option_type"),
+                    "Conf %": info["confidence"] or None,
                     "Prior premium": row.get("prev_premium") or None,
-                    "Tape ₹": round(prem, 2) if prem else None,
-                    "Spot": round(spot, 2) if spot else None,
+                    "Tape ₹": round(info["premium"], 2) if info["premium"] else None,
+                    "Spot": round(info["spot"], 2) if info["spot"] else None,
                     "Spot ref": row.get("spot_ref"),
                     "Status": (
                         "TAKEN"
                         if row.get("underlying") in taken
-                        else ("READY TO BUY" if fire else "watching")
+                        else info["status"]
                     ),
-                    "Why": why or "—",
+                    "Why": info["why"] or "—",
                 }
             )
-        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+            if info.get("manual_ok"):
+                auction_ready.append((row, info))
+        st.dataframe(pd.DataFrame(auction_rows), width="stretch", hide_index=True)
+        auction_charts = []
+        for plan_row, table_row in zip(auction_plan, auction_rows):
+            auction_charts.append(
+                {
+                    "label": f"{plan_row.get('tradingsymbol')} ({plan_row.get('underlying')})",
+                    "token": int(plan_row.get("instrument_token") or 0),
+                    "premium": table_row.get("Tape ₹"),
+                    "stop": None,
+                    "target": None,
+                }
+            )
+        _render_nfo_buy_charts(kite_client_for_health, auction_charts, "auction_nfo")
+        if auction_ready:
+            st.markdown("**Enter now** — tape says go in; you confirm the fill.")
+            if live_kite.is_enabled(paper_state):
+                st.caption("Live mirroring is ON — this button also sends the Zerodha MIS buy.")
+            cols = st.columns(min(3, len(auction_ready)))
+            for idx, (row, _info) in enumerate(auction_ready):
+                label = str(row.get("tradingsymbol") or row.get("underlying"))
+                with cols[idx % len(cols)]:
+                    if st.button(
+                        f"Enter {label} now",
+                        type="primary",
+                        key=f"manual_auction_{row.get('underlying')}_{label}",
+                    ):
+                        fresh = paper_trader.load_state()
+                        event, err = open_auction.manual_enter(
+                            fresh, row, kite_client_for_health
+                        )
+                        _show_manual_enter_result(event, err, label)
     elif open_auction.in_prep_window():
         st.caption("Arming overnight ATM list… headless trader builds this from 09:00 IST.")
     else:
@@ -626,6 +835,58 @@ def render_will_buy_next() -> None:
             if str(c).startswith("_") or c == "instrument_token"
         ]
         st.dataframe(show.drop(columns=drop, errors="ignore"), width="stretch", hide_index=True)
+        will_charts = []
+        for row in plan_rows:
+            tok = int(row.get("instrument_token") or 0)
+            if tok <= 0 and row.get("Underlying") in chosen:
+                tok = int(getattr(chosen[row["Underlying"]], "instrument_token", 0) or 0)
+            will_charts.append(
+                {
+                    "label": f"{row.get('Contract')} ({row.get('Underlying')})",
+                    "token": tok,
+                    "premium": row.get("Premium"),
+                    "stop": row.get("Stop"),
+                    "target": row.get("Target"),
+                }
+            )
+        _render_nfo_buy_charts(kite_client_for_health, will_charts, "willbuy_nfo")
+        ready = [
+            row
+            for row in plan_rows
+            if str(row.get("Status") or "").startswith("WILL BUY")
+            and row.get("Underlying") in chosen
+        ]
+        if ready:
+            st.markdown("**Enter now** — the book wants these; you confirm the fill.")
+            if live_kite.is_enabled(state):
+                st.caption("Live mirroring is ON — this button also sends the Zerodha MIS buy.")
+            cols = st.columns(min(3, len(ready)))
+            for idx, row in enumerate(ready):
+                symbol = str(row["Underlying"])
+                label = str(row.get("Contract") or symbol)
+                with cols[idx % len(cols)]:
+                    if st.button(
+                        f"Enter {label} now",
+                        type="primary",
+                        key=f"manual_willbuy_{symbol}_{label}",
+                    ):
+                        fresh = paper_trader.load_state()
+                        contract = chosen[symbol]
+                        budget = float(
+                            (ctx.get("candidate_budgets") or {}).get(
+                                symbol, fresh.get("cash") or 0
+                            )
+                        )
+                        event, err = paper_trader.manual_enter_option(
+                            fresh,
+                            symbol,
+                            contract,
+                            int(row.get("Conf %") or 0),
+                            int(row.get("Score") or 0),
+                            budget,
+                            extra={"entry_style": "manual", "manual_reason": row.get("Status")},
+                        )
+                        _show_manual_enter_result(event, err, label)
         if ctx.get("last_plan_at"):
             st.caption(f"Last plan from the headless trader: {ctx['last_plan_at']}")
     else:
@@ -640,6 +901,21 @@ def render_will_buy_next() -> None:
                 "No premium sized for a fill this refresh — closest entry-eligible setups:"
             )
             st.dataframe(pd.DataFrame(watch_rows), width="stretch", hide_index=True)
+            watch_charts = []
+            for row in watch_rows:
+                contract = search.get(row.get("Underlying"))
+                if contract is None:
+                    continue
+                watch_charts.append(
+                    {
+                        "label": f"{contract.tradingsymbol} ({row.get('Underlying')})",
+                        "token": int(contract.instrument_token or 0),
+                        "premium": contract.premium,
+                        "stop": contract.stop,
+                        "target": contract.target,
+                    }
+                )
+            _render_nfo_buy_charts(kite_client_for_health, watch_charts, "watch_nfo")
         else:
             st.caption("No ATM option is sized for a fill on this cycle.")
             if not halt:
@@ -689,6 +965,27 @@ if paper_state["open_positions"]:
             }
         )
     st.dataframe(pd.DataFrame(position_rows), width="stretch", hide_index=True)
+    sl_col, _ = st.columns([1, 3])
+    with sl_col:
+        if paper_state.get("auto_stop_loss_exit"):
+            if st.button(
+                "Disable auto stop/target exit",
+                type="primary",
+                key="disable_auto_stop_loss",
+            ):
+                paper_trader.set_auto_stop_loss_exit(paper_state, False)
+                st.rerun()
+        else:
+            st.caption("Auto stop/target is OFF. The bot will ask — click Exit if you want out.")
+    stop_asks = paper_trader.pending_stop_asks(paper_state)
+    if stop_asks:
+        st.error(
+            "Stop-loss hit — waiting for you: "
+            + ", ".join(
+                f"{a['contract']} ({a['reason']})"
+                for a in stop_asks
+            )
+        )
     st.markdown("**Manual exit**")
     if live_kite.is_enabled(paper_state):
         st.caption(
@@ -871,13 +1168,16 @@ if rows:
             return "background-color: #3b1010; color: #FF8A80"
         return "background-color: #333; color: #ddd"
 
-    st.dataframe(
-        df_table.style.map(color_now, subset=["Do now"])
-        .map(color_signal, subset=["Signal"])
-        .map(color_bias, subset=["Tomorrow"]),
-        width="stretch",
-        hide_index=True,
-    )
+    styled = df_table.style
+    if "Do this" in df_table.columns:
+        styled = styled.map(color_now, subset=["Do this"])
+    if "Do now" in df_table.columns:
+        styled = styled.map(color_now, subset=["Do now"])
+    if "Signal" in df_table.columns:
+        styled = styled.map(color_signal, subset=["Signal"])
+    if "Tomorrow" in df_table.columns:
+        styled = styled.map(color_bias, subset=["Tomorrow"])
+    st.dataframe(styled, width="stretch", hide_index=True)
 else:
     st.info("No data loaded yet.")
 

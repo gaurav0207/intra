@@ -60,8 +60,9 @@ def new_state(initial_cash: float) -> dict[str, Any]:
         "last_briefing_signature": "",
         "login_email_date": "",
         "day_end_email_date": "",
-        "auto_trading_enabled": True,
+        "auto_trading_enabled": False,
         "live_trading_enabled": False,
+        "auto_stop_loss_exit": False,
         "loss_halt_date": "",
         "loss_halt_reason": "",
         "open_auction_plan": [],
@@ -97,8 +98,9 @@ def load_state(initial_cash: float | None = None) -> dict[str, Any]:
         state.setdefault("last_briefing_signature", "")
         state.setdefault("login_email_date", "")
         state.setdefault("day_end_email_date", "")
-        state.setdefault("auto_trading_enabled", True)
+        state.setdefault("auto_trading_enabled", False)
         state.setdefault("live_trading_enabled", False)
+        state.setdefault("auto_stop_loss_exit", False)
         state.setdefault("loss_halt_date", "")
         state.setdefault("loss_halt_reason", "")
         state.setdefault("open_auction_plan", [])
@@ -137,6 +139,7 @@ def save_state(state: dict[str, Any]) -> None:
                     "seen_intents",
                     "auto_trading_enabled",
                     "live_trading_enabled",
+                    "auto_stop_loss_exit",
                     "loss_halt_date",
                     "loss_halt_reason",
                     "open_auction_plan",
@@ -162,7 +165,11 @@ def reset_state(initial_cash: float) -> dict[str, Any]:
         try:
             old = json.loads(STATE_PATH.read_text())
             if isinstance(old, dict):
-                for key in ("auto_trading_enabled", "live_trading_enabled"):
+                for key in (
+                    "auto_trading_enabled",
+                    "live_trading_enabled",
+                    "auto_stop_loss_exit",
+                ):
                     if key in old:
                         preserved[key] = old[key]
         except (OSError, ValueError, json.JSONDecodeError):
@@ -726,6 +733,119 @@ def _record_event(state: dict[str, Any], event: dict[str, Any]) -> None:
     state["events"] = state["events"][-1000:]
 
 
+def auto_stop_loss_enabled(state: dict[str, Any] | None) -> bool:
+    """Default OFF — stop-loss asks; it does not flatten the book."""
+    if not state:
+        return False
+    return bool(state.get("auto_stop_loss_exit", False))
+
+
+def set_auto_stop_loss_exit(state: dict[str, Any], enabled: bool) -> dict[str, Any]:
+    state["auto_stop_loss_exit"] = bool(enabled)
+    save_state(state)
+    return state
+
+
+def is_stop_loss_reason(reason: str | None) -> bool:
+    text = str(reason or "").lower()
+    return (
+        "premium stop" in text
+        or "stop-loss" in text
+        or "breakeven stop" in text
+    )
+
+
+def is_manual_exit_reason(reason: str | None) -> bool:
+    """Stop, target, and reversal wait for you. Square-off and daily-loss still flatten."""
+    text = str(reason or "").lower()
+    return (
+        is_stop_loss_reason(reason)
+        or "profit taken" in text
+        or "signal reversal" in text
+        or "setup exited" in text
+    )
+
+
+def pending_stop_asks(state: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for symbol, position in (state.get("open_positions") or {}).items():
+        ask = position.get("stop_ask") or {}
+        if not ask.get("active"):
+            continue
+        rows.append(
+            {
+                "symbol": symbol,
+                "contract": position.get("contract") or symbol,
+                "reason": ask.get("reason") or "Stop-loss hit",
+                "mark": ask.get("mark"),
+                "asked_at": ask.get("asked_at"),
+            }
+        )
+    return rows
+
+
+def request_stop_exit(
+    state: dict[str, Any],
+    symbol: str,
+    position: dict[str, Any],
+    mark: float,
+    reason: str,
+) -> dict[str, Any] | None:
+    """Ask the user to exit. Do not close the position."""
+    existing = position.get("stop_ask")
+    if isinstance(existing, dict) and existing.get("active"):
+        existing["mark"] = round(float(mark), 2)
+        existing["reason"] = reason
+        position["stop_ask"] = existing
+        save_state(state)
+        return None
+    ask = {
+        "active": True,
+        "reason": reason,
+        "mark": round(float(mark), 2),
+        "asked_at": _now(),
+    }
+    position["stop_ask"] = ask
+    label = position.get("contract") or symbol
+    body = (
+        f"STOP HIT — the bot did not exit.\n\n"
+        f"Contract: {label}\n"
+        f"Underlying: {symbol}\n"
+        f"Reason: {reason}\n"
+        f"Mark: ₹{float(mark):,.2f}\n"
+        f"Stop: ₹{float(position.get('stop') or 0):,.2f}\n\n"
+        "Open the dashboard and click Exit if you want out."
+    )
+    ok, detail = send_email(f"[Trader] STOP ASK: {label}", body)
+    ask["email"] = {"sent": ok, "detail": detail}
+    event = {
+        "time": _now(),
+        "type": "STOP_ASK",
+        "symbol": symbol,
+        "contract": label,
+        "reason": reason,
+        "mark": round(float(mark), 2),
+        "email": {"sent": ok, "detail": detail},
+    }
+    _record_event(state, event)
+    save_state(state)
+    return event
+
+
+def clear_recovered_stop_ask(position: dict[str, Any], mark: float) -> bool:
+    ask = position.get("stop_ask") or {}
+    if not ask.get("active"):
+        return False
+    stop = float(position.get("stop") or 0)
+    if stop <= 0:
+        return False
+    recovered = float(mark) > stop + max(0.05, stop * 0.01)
+    if not recovered:
+        return False
+    position["stop_ask"] = {}
+    return True
+
+
 def is_option_position(position: dict[str, Any]) -> bool:
     return bool(position.get("contract"))
 
@@ -882,6 +1002,45 @@ def open_position(
     event["email"] = {"sent": ok, "detail": detail}
     save_state(state)
     return event
+
+
+def manual_enter_option(
+    state: dict[str, Any],
+    symbol: str,
+    contract: Any,
+    confidence: int,
+    score: int,
+    budget: float,
+    spot: float | None = None,
+    extra: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any] | None, str]:
+    """Dashboard-confirmed fill. Bypasses the auto window; still uses cash + MIS checks."""
+    symbol = str(symbol)
+    if symbol in (state.get("open_positions") or {}):
+        return None, "already in the book"
+    if contract is None:
+        return None, "no contract"
+    payload = dict(extra or {})
+    payload.setdefault("entry_style", "manual")
+    key = f"{symbol}|{_now()}|{contract.option_type}|MANUAL"
+    event = open_position(
+        state,
+        symbol,
+        "LONG" if str(contract.option_type).upper() == "CE" else "SHORT",
+        float(spot or contract.premium),
+        float(budget),
+        contract.stop,
+        contract.target,
+        int(confidence),
+        int(score),
+        key,
+        contract=contract,
+        spot_at_entry=spot,
+        extra=payload,
+    )
+    if event:
+        return event, ""
+    return None, "fill rejected (cash, OI, live order, or already open)"
 
 
 def manual_exit_positions(
@@ -1472,7 +1631,16 @@ def run_cycle(
             elif now >= SQUARE_OFF:
                 reason = "Intraday square-off at/after 15:15 IST"
 
+        if reason is None and option:
+            if clear_recovered_stop_ask(position, fill):
+                save_state(state)
         if reason:
+            if is_manual_exit_reason(reason) and not auto_stop_loss_enabled(state):
+                asked = request_stop_exit(state, symbol, position, fill, reason)
+                if asked:
+                    events.append(asked)
+                continue
+            position.pop("stop_ask", None)
             event = close_position(state, symbol, fill, reason)
             if event:
                 events.append(event)

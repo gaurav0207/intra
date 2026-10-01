@@ -4,8 +4,9 @@ The regular book waits for the 15-minute opening range and a 5-minute
 stock score (entries from 09:30). This mode is separate:
 
 1. From 09:00, map a strong daily bias to an ATM CE or PE and subscribe it.
-2. From 09:15–09:30, buy if that option (or the underlying) has already
-   gapped — using WebSocket last prices, not the 5-minute score.
+2. From 09:15–09:40, buy if that option (or the underlying) has already
+   gapped and confidence clears — a ≥50% premium gap is itself the
+   confidence; smaller gaps need the 5-minute side to agree.
 """
 
 from __future__ import annotations
@@ -17,11 +18,15 @@ from typing import Any
 from data import IST, fetch_daily
 from indicators import compute_all
 from options import OptionContract, pick_chain_row, premium_levels
-from signals import Signal, attach_tomorrow_forecast
+from signals import Signal, attach_tomorrow_forecast, entry_side
+
+_signal_cache: dict[str, tuple[float, Any]] = {}
+_signal_cache_ttl = 25.0
 
 PREP_START = dt.time(9, 0)
 ENTRY_START = dt.time(9, 15)
-ENTRY_END = dt.time(9, 30)
+# Late prints (stale WS, REST catch-up) still fill for a few minutes after 09:30.
+ENTRY_END = dt.time(9, 40)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -65,6 +70,16 @@ def min_spot_gap() -> float:
     return max(0.005, min(0.08, _env_float("OPEN_AUCTION_MIN_SPOT_GAP_PCT", 0.015)))
 
 
+def min_confidence() -> int:
+    """Same floor as the 09:30 book unless OPEN_AUCTION_MIN_CONFIDENCE is set."""
+    import trading_policy
+
+    return max(
+        0,
+        min(100, _env_int("OPEN_AUCTION_MIN_CONFIDENCE", trading_policy.min_confidence())),
+    )
+
+
 def _now_ist() -> dt.datetime:
     return dt.datetime.now(IST)
 
@@ -90,6 +105,18 @@ def bias_to_option(bias: str) -> str | None:
     if bias == "BEARISH":
         return "PE"
     return None
+
+
+def tape_gap_confidence(premium: float, prev_premium: float) -> int:
+    """Map option-premium stretch to the same 0–100 scale as the 5m book.
+
+    A 50% gap is 70% confidence (the floor). 90%+ is ~94–100. A 25% gap
+    is only ~55, so those still need the 5-minute side to agree.
+    """
+    if prev_premium <= 0 or premium <= 0:
+        return 0
+    gap = (float(premium) - float(prev_premium)) / float(prev_premium)
+    return max(0, min(100, int(round(70 + (gap - 0.50) * 60))))
 
 
 def tape_should_fire(
@@ -119,6 +146,62 @@ def tape_should_fire(
     if not reasons:
         return False, ""
     return True, "; ".join(reasons)
+
+
+def signal_allows_option(sig: Signal | None, option_type: str, floor: int | None = None) -> tuple[bool, str]:
+    """Tape gap is not enough — the 5m score must agree and clear the confidence floor."""
+    floor = min_confidence() if floor is None else int(floor)
+    option_type = (option_type or "").upper()
+    if sig is None:
+        return False, "no 5m signal yet"
+    conf = int(sig.confidence or 0)
+    if conf < floor:
+        return False, f"confidence {conf}% < {floor}%"
+    want = "LONG" if option_type == "CE" else "SHORT"
+    action = str(sig.what_to_do or "").upper()
+    if "EXIT" in action:
+        return False, f"{sig.what_to_do} · {conf}%"
+    side = entry_side(sig)
+    if side == want:
+        return True, f"{sig.what_to_do} · {conf}%"
+    if want == "SHORT" and (int(sig.score) <= -4 or "SHORT" in action):
+        return True, f"{sig.what_to_do} · score {sig.score} · {conf}%"
+    if want == "LONG" and (int(sig.score) >= 4 or "LONG" in action):
+        return True, f"{sig.what_to_do} · score {sig.score} · {conf}%"
+    return False, f"{sig.what_to_do} · {conf}% does not confirm {option_type}"
+
+
+def _index_frame(kite):
+    from data import fetch_index
+
+    try:
+        raw = fetch_index(interval="5m", kite=kite)
+        if raw is not None and not raw.empty:
+            return compute_all(raw)
+    except Exception:
+        pass
+    return None
+
+
+def cached_signal(symbol: str, kite, index_df=None):
+    """Reuse a 5m signal for a few seconds so the 09:15 loop stays fast."""
+    import time
+
+    import scanner
+
+    now = time.monotonic()
+    hit = _signal_cache.get(symbol)
+    if hit and now - hit[0] < _signal_cache_ttl:
+        return hit[1]
+    try:
+        result = scanner._one(
+            symbol, "5m", kite, 1.5, 2.5, False, index_df
+        )
+        sig = result[1] if result else None
+    except Exception:
+        sig = None
+    _signal_cache[symbol] = (now, sig)
+    return sig
 
 
 def _dummy_signal(symbol: str, close: float) -> Signal:
@@ -290,7 +373,7 @@ def build_plan(kite) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
                 ranked.append((score, built))
         except Exception:
             continue
-    ranked.sort(reverse=True)
+    ranked.sort(key=lambda item: item[0], reverse=True)
     return [row for _, row in ranked[: max_names()]], spots
 
 
@@ -407,23 +490,170 @@ def _rest_ltp(kite, symbol: str, is_option: bool) -> float:
         return 0.0
 
 
+def _best_ltp(ws: float, rest: float, prev: float = 0.0) -> float:
+    """Do not let a stale WebSocket print hide a REST gap (GRASIM-style miss)."""
+    ws = float(ws or 0)
+    rest = float(rest or 0)
+    prev = float(prev or 0)
+    if ws <= 0:
+        return rest
+    if rest <= 0:
+        return ws
+    if prev > 0 and abs(ws - prev) / prev <= 0.08 and rest > prev * 1.15:
+        return rest
+    return max(ws, rest)
+
+
 def evaluate_row(row: dict[str, Any], kite=None) -> tuple[bool, str, float, float]:
-    premium = _live_ltp(int(row.get("instrument_token") or 0))
-    if premium <= 0:
-        premium = _rest_ltp(kite, str(row["tradingsymbol"]), True)
-    spot = _live_ltp(int(row.get("spot_token") or 0))
-    if spot <= 0:
-        spot = _rest_ltp(kite, str(row["underlying"]), False)
+    prev = float(row.get("prev_premium") or 0)
+    premium = _best_ltp(
+        _live_ltp(int(row.get("instrument_token") or 0)),
+        _rest_ltp(kite, str(row["tradingsymbol"]), True),
+        prev,
+    )
+    spot = _best_ltp(
+        _live_ltp(int(row.get("spot_token") or 0)),
+        _rest_ltp(kite, str(row["underlying"]), False),
+        0.0,
+    )
     if spot <= 0:
         spot = float(row.get("spot_ref") or 0)
     fire, why = tape_should_fire(
         str(row["option_type"]),
         premium,
-        float(row.get("prev_premium") or 0),
+        prev,
         spot,
         float(row.get("spot_ref") or 0),
     )
     return fire, why, premium, spot
+
+
+def evaluate_candidate(
+    row: dict[str, Any],
+    kite=None,
+    index_df=None,
+) -> tuple[bool, str, float, float, int]:
+    """Tape gap plus confidence. A ≥50% premium gap is itself the confidence."""
+    fire, why, premium, spot = evaluate_row(row, kite)
+    prev = float(row.get("prev_premium") or 0)
+    gap = ((premium - prev) / prev) if prev > 0 and premium > 0 else 0.0
+    large_gap = gap >= 0.50
+    sig = cached_signal(str(row["underlying"]), kite, index_df) if kite is not None else None
+    ok_sig, sig_why = signal_allows_option(sig, str(row["option_type"]))
+    sig_conf = int(getattr(sig, "confidence", 0) or 0)
+    gap_conf = tape_gap_confidence(premium, prev) if fire else 0
+    if large_gap:
+        conf = max(sig_conf, gap_conf)
+        sig_why = f"tape gap {gap:.0%} · conf {conf}%"
+        ok_sig = conf >= min_confidence()
+    else:
+        conf = sig_conf
+    if not fire:
+        return False, why or "waiting for gap", premium, spot, conf
+    if not ok_sig:
+        return False, sig_why, premium, spot, conf
+    return True, f"{why}; {sig_why}", premium, spot, conf
+
+
+def fill_block_reason(
+    state: dict[str, Any] | None,
+    row: dict[str, Any],
+    premium: float,
+    kite=None,
+) -> str:
+    """Why try_entries would still skip a tape-ready name."""
+    import live_kite
+    import paper_trader
+    import trading_policy
+
+    symbol = str(row.get("underlying") or "")
+    if not enabled():
+        return "open auction off"
+    if not in_entry_window():
+        return f"window closed {ENTRY_END:%H:%M}"
+    if state is None:
+        return ""
+    if not state.get("auto_trading_enabled", True):
+        return "auto trading off"
+    halt = paper_trader.session_entry_block_reason(
+        state, {}, None, trading_policy.daily_loss_cap(), None
+    )
+    if halt:
+        return halt
+    blocked = trading_policy.entry_block_reason(state)
+    if blocked:
+        return blocked
+    if symbol in (state.get("open_positions") or {}):
+        return "already in the book"
+    if symbol in (state.get("open_auction_taken") or []):
+        return "already taken this session"
+    already = sum(
+        1
+        for pos in (state.get("open_positions") or {}).values()
+        if str(pos.get("entry_style") or "").startswith("open_auction")
+        or str(pos.get("signal_key") or "").endswith("OPEN_AUCTION")
+    )
+    if already >= max_positions():
+        return f"auction slot used ({already}/{max_positions()})"
+    contract = plan_to_contract(row, premium)
+    if contract is None:
+        return "premium too small"
+    budget = min(float(state.get("cash") or 0), live_kite.remaining_capital(state))
+    need = contract.cost_per_lot()
+    if budget < need:
+        return f"need ₹{need:,.0f} for 1 lot, have ₹{budget:,.0f}"
+    probe = {
+        "contract": contract.tradingsymbol,
+        "lots": 1,
+        "lot_size": int(contract.lot_size),
+        "entry_price": float(contract.premium),
+        "quantity": int(contract.lot_size),
+        "amount_invested": need,
+    }
+    try:
+        ok, note = live_kite.validate_entry(state, probe)
+    except Exception as exc:  # noqa: BLE001
+        return str(exc)
+    if not ok:
+        return note or "broker rejected"
+    return ""
+
+
+def diagnose(
+    row: dict[str, Any],
+    kite=None,
+    state: dict[str, Any] | None = None,
+    index_df=None,
+) -> dict[str, Any]:
+    """Dashboard/trader status that matches what try_entries will actually do."""
+    ok, why, premium, spot, conf = evaluate_candidate(row, kite, index_df)
+    symbol = str(row.get("underlying") or "")
+    taken = set((state or {}).get("open_auction_taken") or [])
+    if symbol in taken or symbol in ((state or {}).get("open_positions") or {}):
+        status = "TAKEN"
+    elif not in_entry_window():
+        status = "MISSED — window closed" if ok else "watching"
+        if ok:
+            why = f"{why}; buys stop at {ENTRY_END:%H:%M}" if why else f"buys stop at {ENTRY_END:%H:%M}"
+    elif not ok:
+        status = "watching"
+    else:
+        block = fill_block_reason(state, row, premium, kite)
+        if block:
+            status = "BLOCKED"
+            why = block
+        else:
+            status = "READY TO BUY"
+    return {
+        "ok": bool(ok and status == "READY TO BUY"),
+        "manual_ok": bool(ok) and symbol not in taken
+        and symbol not in ((state or {}).get("open_positions") or {}),
+        "status": status,
+        "why": why or "—",
+        "premium": premium,
+        "spot": spot,
+        "confidence": conf,
+    }
 
 
 def try_entries(state: dict[str, Any], kite) -> list[dict[str, Any]]:
@@ -466,7 +696,8 @@ def try_entries(state: dict[str, Any], kite) -> list[dict[str, Any]]:
     if slots < 1:
         return events
 
-    scored: list[tuple[float, dict[str, Any], str, float, float]] = []
+    index_df = _index_frame(kite)
+    scored: list[tuple[float, dict[str, Any], str, float, float, int]] = []
     for row in plan:
         symbol = str(row["underlying"])
         if symbol in state.get("open_positions", {}):
@@ -476,17 +707,27 @@ def try_entries(state: dict[str, Any], kite) -> list[dict[str, Any]]:
         key = f"{symbol}|{today}|{row['option_type']}|OPEN_AUCTION"
         if key in (state.get("seen_entries") or []):
             continue
-        fire, why, premium, spot = evaluate_row(row, kite)
-        if not fire or premium <= 0.5:
+        ok, why, premium, spot, conf = evaluate_candidate(row, kite, index_df)
+        if not ok or premium <= 0.5:
+            continue
+        block = fill_block_reason(state, row, premium, kite)
+        if block:
+            skips = list(state.get("open_auction_skips") or [])
+            note = f"{row.get('tradingsymbol')}: {block}"
+            if note not in skips[-8:]:
+                skips.append(note)
+                state["open_auction_skips"] = skips[-20:]
+                paper_trader.save_state(state)
+            print(f"Open auction skip {note}", flush=True)
             continue
         stretch = 0.0
         prev = float(row.get("prev_premium") or 0)
         if prev > 0:
             stretch = (premium - prev) / prev
-        scored.append((stretch, row, why, premium, spot))
-    scored.sort(reverse=True)
+        scored.append((stretch, row, why, premium, spot, conf))
+    scored.sort(key=lambda item: item[0], reverse=True)
 
-    for _, row, why, premium, spot in scored[:slots]:
+    for _, row, why, premium, spot, conf in scored[:slots]:
         contract = plan_to_contract(row, premium)
         if contract is None:
             continue
@@ -504,7 +745,7 @@ def try_entries(state: dict[str, Any], kite) -> list[dict[str, Any]]:
             budget,
             contract.stop,
             contract.target,
-            0,
+            conf,
             int(row.get("score") or 0),
             key,
             contract=contract,
@@ -524,10 +765,53 @@ def try_entries(state: dict[str, Any], kite) -> list[dict[str, Any]]:
     return events
 
 
+def manual_enter(state: dict[str, Any], row: dict[str, Any], kite=None) -> tuple[dict[str, Any] | None, str]:
+    """User clicked Enter now. Ignores the 09:15–09:40 clock and the 1-name slot."""
+    import live_kite
+    import paper_trader
+
+    ok, why, premium, spot, conf = evaluate_candidate(row, kite)
+    if not ok:
+        return None, why or "setup is not a buy"
+    symbol = str(row["underlying"])
+    if symbol in (state.get("open_positions") or {}):
+        return None, "already in the book"
+    contract = plan_to_contract(row, premium)
+    if contract is None:
+        return None, "premium too small"
+    budget = min(float(state.get("cash") or 0), live_kite.remaining_capital(state))
+    if budget < contract.cost_per_lot():
+        return None, (
+            f"need ₹{contract.cost_per_lot():,.0f} for 1 lot, have ₹{budget:,.0f}"
+        )
+    event, err = paper_trader.manual_enter_option(
+        state,
+        symbol,
+        contract,
+        conf,
+        int(row.get("score") or 0),
+        budget,
+        spot=spot,
+        extra={
+            "entry_style": "open_auction_manual",
+            "open_auction_reason": f"manual · {why}",
+        },
+    )
+    if event:
+        taken = list(state.get("open_auction_taken") or [])
+        if symbol not in taken:
+            taken.append(symbol)
+            state["open_auction_taken"] = taken
+            paper_trader.save_state(state)
+        return event, ""
+    return None, err
+
+
 def summary_line() -> str:
     if not enabled():
         return "Open auction OFF"
     return (
-        f"Open auction 09:15–09:30 · ≤{max_positions()} name(s) · "
+        f"Open auction 09:15–{ENTRY_END:%H:%M} · ≤{max_positions()} name(s) · "
+        f"conf ≥{min_confidence()}% (50%+ tape gap counts) · "
         f"premium gap ≥{min_premium_gap():.0%} or spot gap ≥{min_spot_gap():.1%}"
     )

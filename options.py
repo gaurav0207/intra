@@ -190,6 +190,62 @@ def premium_levels(premium: float) -> tuple[float, float]:
     return stop, target
 
 
+def fetch_nfo_intraday(kite, token: int, interval: str = "minute", days: int = 2):
+    """OHLCV for one NFO contract. ``minute`` shows spikes the 5m stock signal misses."""
+    import pandas as pd
+
+    from data import IST
+
+    if kite is None or int(token or 0) <= 0:
+        return pd.DataFrame()
+    now = dt.datetime.now(IST)
+    start = now - dt.timedelta(days=max(1, int(days)))
+    try:
+        records = kite.historical_data(int(token), start, now, interval) or []
+    except Exception:
+        return pd.DataFrame()
+    if not records:
+        return pd.DataFrame()
+    df = pd.DataFrame(records)
+    df = df.rename(columns=str.lower)
+    df["date"] = pd.to_datetime(df["date"])
+    if df["date"].dt.tz is None:
+        df["date"] = df["date"].dt.tz_localize(IST)
+    else:
+        df["date"] = df["date"].dt.tz_convert(IST)
+    df = df.set_index("date")
+    keep = [c for c in ("open", "high", "low", "close", "volume") if c in df.columns]
+    return df[keep]
+
+
+def premium_peak_note(df, last: float | None = None) -> str:
+    """Warn when the suggested premium is sitting on today's high."""
+    if df is None or getattr(df, "empty", True):
+        return ""
+    from data import IST
+
+    today = dt.datetime.now(IST).date()
+    idx = df.index.tz_convert(IST) if getattr(df.index, "tz", None) else df.index
+    try:
+        session = df.loc[idx.date == today]
+    except Exception:
+        session = df
+    if session is None or session.empty:
+        session = df
+    hi = float(session["high"].max())
+    mark = float(last if last and last > 0 else session["close"].iloc[-1])
+    if hi <= 0 or mark <= 0:
+        return ""
+    pct = mark / hi
+    lo = float(session["low"].min())
+    if pct >= 0.92:
+        return (
+            f"Premium ₹{mark:.2f} is {pct:.0%} of today's high ₹{hi:.2f} "
+            f"(low ₹{lo:.2f}) — 5m signal may be buying the spike"
+        )
+    return f"Premium ₹{mark:.2f} vs today's high ₹{hi:.2f} ({pct:.0%}) · low ₹{lo:.2f}"
+
+
 def fetch_nfo_quotes(kite, tradingsymbols: list[str]) -> dict[str, dict[str, Any]]:
     """One batched ``kite.quote`` per chunk (fallback when WebSocket has no tick)."""
     if not kite or not tradingsymbols:
